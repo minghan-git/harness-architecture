@@ -30,105 +30,48 @@ graph LR
 架構由外到內分五層。外層包住內層，提供約束和服務。
 
 ### Fig A · Layer relationships
-
-<svg width="100%" viewBox="0 0 680 540" xmlns="http://www.w3.org/2000/svg">
-<style>
-  .ring-label { font-family: sans-serif; font-size: 12px; fill: #888; text-anchor: middle; }
-  .center-title { font-family: sans-serif; font-size: 14px; font-weight: 500; fill: #555; text-anchor: middle; }
-  .center-sub { font-family: sans-serif; font-size: 12px; fill: #999; text-anchor: middle; }
-  .badge text { font-family: sans-serif; font-size: 11px; text-anchor: middle; dominant-baseline: central; }
-  .leader { stroke: #ccc; stroke-width: 0.5; stroke-dasharray: 3 2; }
-  .arr-line { stroke: #bbb; stroke-width: 1; }
-  @media (prefers-color-scheme: dark) {
-    .ring-label { fill: #888; }
-    .center-title { fill: #ccc; }
-    .center-sub { fill: #777; }
-    .leader { stroke: #555; }
-    .arr-line { stroke: #555; }
-    .badge-teal rect { fill: #085041; stroke: #5DCAA5; } .badge-teal text { fill: #9FE1CB; }
-    .badge-blue rect { fill: #0C447C; stroke: #85B7EB; } .badge-blue text { fill: #B5D4F4; }
-    .badge-coral rect { fill: #712B13; stroke: #F0997B; } .badge-coral text { fill: #F5C4B3; }
-    .badge-pink rect { fill: #72243E; stroke: #ED93B1; } .badge-pink text { fill: #F4C0D1; }
-    .badge-amber rect { fill: #633806; stroke: #FAC775; } .badge-amber text { fill: #FAC775; }
-    .badge-gray rect { fill: #444441; stroke: #B4B2A9; } .badge-gray text { fill: #D3D1C7; }
-    .badge-purple rect { fill: #3C3489; stroke: #AFA9EC; } .badge-purple text { fill: #CECBF6; }
-  }
-  @media (prefers-color-scheme: light) {
-    .badge-teal rect { fill: #E1F5EE; stroke: #0F6E56; } .badge-teal text { fill: #085041; }
-    .badge-blue rect { fill: #E6F1FB; stroke: #185FA5; } .badge-blue text { fill: #0C447C; }
-    .badge-coral rect { fill: #FAECE7; stroke: #993C1D; } .badge-coral text { fill: #712B13; }
-    .badge-pink rect { fill: #FBEAF0; stroke: #993556; } .badge-pink text { fill: #72243E; }
-    .badge-amber rect { fill: #FAEEDA; stroke: #854F0B; } .badge-amber text { fill: #633806; }
-    .badge-gray rect { fill: #F1EFE8; stroke: #5F5E5A; } .badge-gray text { fill: #444441; }
-    .badge-purple rect { fill: #EEEDFE; stroke: #534AB7; } .badge-purple text { fill: #3C3489; }
-  }
-</style>
-
-<circle cx="340" cy="270" r="215" fill="none" stroke="#4ecdc4" stroke-width="0.9" stroke-dasharray="4 3" opacity="0.45"/>
-<circle cx="340" cy="270" r="145" fill="none" stroke="#4ecdc4" stroke-width="0.5" opacity="0.3"/>
-<circle cx="340" cy="270" r="75" fill="none" stroke="#4ecdc4" stroke-width="0.5" opacity="0.2"/>
-
-<text class="center-title" x="340" y="266" dominant-baseline="central">L4 · Agent</text>
-<text class="center-sub" x="340" y="284">Specialized AI workers</text>
-<text class="ring-label" x="340" y="136">L2 · Context + L3 · Pipeline</text>
-<text class="ring-label" x="340" y="64" opacity="0.8">L1 · Harness shell</text>
-
-<g class="badge badge-teal"><rect x="270" y="26" width="140" height="28" rx="6" stroke-width="0.5"/><text x="340" y="40">L1 · Authority</text></g>
-<g class="badge badge-blue"><rect x="524" y="120" width="146" height="28" rx="6" stroke-width="0.5"/><text x="597" y="134">L1 · Observability</text></g>
-<g class="badge badge-coral"><rect x="536" y="310" width="140" height="28" rx="6" stroke-width="0.5"/><text x="606" y="324">L1 · Error recovery</text></g>
-<g class="badge badge-pink"><rect x="518" y="410" width="162" height="28" rx="6" stroke-width="0.5"/><text x="599" y="424">L1 · Self-improvement</text></g>
-<g class="badge badge-teal"><rect x="6" y="178" width="172" height="28" rx="6" stroke-width="0.5"/><text x="92" y="192">L3 · Deterministic pipeline</text></g>
-<g class="badge badge-amber"><rect x="30" y="410" width="126" height="28" rx="6" stroke-width="0.5"/><text x="93" y="424">L3 · Eval gate</text></g>
-<g class="badge badge-blue"><rect x="8" y="310" width="150" height="28" rx="6" stroke-width="0.5"/><text x="83" y="324">L2 · Context engine</text></g>
-<g class="badge badge-gray"><rect x="532" y="220" width="126" height="28" rx="6" stroke-width="0.5"/><text x="595" y="234">L4 · Memory</text></g>
-
-<line class="leader" x1="340" y1="54" x2="340" y2="58"/>
-<line class="leader" x1="524" y1="134" x2="500" y2="148"/>
-<line class="leader" x1="536" y1="324" x2="512" y2="318"/>
-<line class="leader" x1="518" y1="424" x2="490" y2="428"/>
-<line class="leader" x1="178" y1="192" x2="204" y2="208"/>
-<line class="leader" x1="158" y1="324" x2="200" y2="306"/>
-<line class="leader" x1="156" y1="424" x2="200" y2="416"/>
-<line class="leader" x1="532" y1="234" x2="506" y2="245"/>
-
-<g class="badge badge-purple"><rect x="278" y="502" width="124" height="30" rx="8" stroke-width="0.5"/><text x="340" y="517">Commander</text></g>
-<line class="arr-line" x1="340" y1="485" x2="340" y2="502" marker-end="url(#arrow)"/>
-<defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
-
-</svg>
+![圖片描述](https://github.com/minghan-git/harness-architecture/blob/main/harness-architecture-overview-and-design-principles/harness_architecture_v5.svg)
 
 ### 圖 B · Pipeline 通用流程
-
-任何「從資料到決策」的 Multi-Agent Pipeline 都可以套用這個四階段骨架。
-
 ```mermaid
 graph LR
-    subgraph COLLECT["階段 1 · 收集"]
-        C1["情報收集<br/>Scout"]
-        C2["資料驗證<br/>Validator"]
-        C1 -->|"⚡"| C2
+    subgraph S1["1 · Collect"]
+        direction TB
+        C1["Scout"]
+        C2["Validator"]
+        C1 --> C2
     end
-    subgraph ANALYZE["階段 2 · 分析"]
-        A1["多視角分析<br/>(並行)"]
-        A2["對抗驗證<br/>Critic"]
-        A1 -->|"🤖"| A2
+
+    subgraph S2["2 · Analyze"]
+        direction TB
+        A1["Multi-perspective<br/>(parallel)"]
+        A2["Critic"]
+        A1 --> A2
     end
-    subgraph CREATE["階段 3 · 創造"]
-        CR1["方案生成<br/>Ideator"]
-        CR2["可行性評估<br/>Evaluator"]
-        CR1 -->|"⚡🤖"| CR2
+
+    subgraph S3["3 · Create"]
+        direction TB
+        CR1["Ideator"]
+        CR2["Evaluator"]
+        CR1 --> CR2
     end
-    subgraph DELIVER["階段 4 · 交付"]
-        D1["報告生成<br/>Writer"]
-        D2["📡 推送"]
-        D1 -->|"🎯"| D2
+
+    subgraph S4["4 · Deliver"]
+        direction TB
+        D1["Writer"]
+        D2["Report"]
+        D1 --> D2
     end
-    COLLECT -->|"⚡"| ANALYZE
-    ANALYZE -->|"✅ / ❌ 退回 ≤3"| COLLECT
-    ANALYZE --> CREATE
-    CREATE -->|"✅ / ❌ 退回 ≤2"| ANALYZE
-    CREATE --> DELIVER
+
+    S1 -->|"⚡ eval"| S2
+    S2 -->|"🤖 eval"| S3
+    S3 -->|"📏 eval"| S4
+    S4 -->|"🎯 eval"| CMD["Commander"]
+
+    S2 -.->|"❌ ≤3"| S1
+    S3 -.->|"❌ ≤2"| S2
 ```
+
 
 **Eval legend**: ⚡ Deterministic check · 🤖 LLM-as-Judge · 📏 Business metrics · 🎯 Goal success rate
 
