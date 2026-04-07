@@ -1,0 +1,655 @@
+# Ch3 · L3 Deterministic Pipeline
+
+> 確定性流程編排 + 品質門檻
+> L3 位於 L2（Context Engine）之內、L4（Agent）之外，控制「任務怎麼走」和「品質夠不夠好」
+
+---
+
+## 本章涵蓋
+
+```mermaid
+graph LR
+    subgraph L3["L3 · Deterministic Pipeline"]
+        SD["Step 定義"]
+        CM["通訊模式"]
+        EG["Eval Gate"]
+        FB["退回迴圈"]
+    end
+```
+
+| 模組 | 核心問題 |
+|------|---------|
+| Step 定義 | 每個 step 收什麼、產什麼、依賴誰？ |
+| 通訊模式 | Step 之間怎麼傳遞資料？平行還是序列？ |
+| Eval Gate | 每個 step 的產出夠好嗎？用什麼標準判斷？ |
+| 退回迴圈 | 不夠好時退回給誰？最多退幾次？ |
+
+---
+
+## 為什麼不讓 LLM 決定流程
+
+### 問題
+
+直覺上，讓一個「聰明的」Manager Agent 用 LLM 來決定「下一步該做什麼、派誰做」似乎很合理。但社群的生產經驗反覆證明這條路走不通。
+
+LLM 擅長在有界問題內生成內容——給它一個明確的任務和 context，它能產出高品質的文字。但讓 LLM 做「元層級決策」（meta-level decisions），也就是決定工作流的排序、何時重試、何時放棄——它會系統性地失敗。
+
+在小專案、短流程中，LLM 驅動的編排可能看起來沒問題。但隨著系統規模增長，以下問題會反覆出現：
+
+| 失敗模式 | 說明 |
+|---------|------|
+| **跳步驟** | LLM 判斷某個 step「不需要」而直接跳過，遺漏關鍵驗證 |
+| **循環依賴** | 兩個 agent 互相等待對方的產出，陷入死鎖 |
+| **分析迴圈** | Agent 認為「還需要更多資料」而無限重複收集，不進入下一階段 |
+| **過早終止** | LLM 判斷「任務已完成」但實際上只完成了一半 |
+| **成本失控** | 沒有確定性的步驟數上限，LLM 可能產生無限制的工具呼叫 |
+
+### 解法：確定性引擎 + Agent 嵌入
+
+把「可預測的」和「不可預測的」分開。
+
+```mermaid
+graph LR
+    subgraph DETERMINISTIC["確定性引擎控制"]
+        D1["Step 順序"]
+        D2["退回條件"]
+        D3["重試上限"]
+        D4["Eval 標準"]
+    end
+
+    subgraph AGENT["Agent 負責"]
+        A1["理解任務"]
+        A2["推理分析"]
+        A3["生成內容"]
+        A4["創意發散"]
+    end
+
+    DETERMINISTIC -->|"框架內"| AGENT
+    AGENT -->|"產出"| DETERMINISTIC
+```
+
+流程引擎（YAML / Flows / 程式碼）定義「先做 A 再做 B，B 失敗時退回 A，最多退 3 次」。Agent 只負責在每個 step 內做實際的推理和生成。Agent 不需要知道自己是 pipeline 的第幾步，也不需要決定下一步該做什麼。
+
+這不是限制 agent 的能力——而是讓 agent 把全部算力集中在它擅長的事情上。
+
+---
+
+## Step 定義
+
+### Step 的結構
+
+每個 step 是 pipeline 的最小執行單位。它的定義需要足夠精確，讓確定性引擎知道怎麼執行，也讓 agent 知道自己的任務邊界。
+
+```
+step:
+  id:           唯一識別碼
+  name:         人類可讀的名稱
+  agent:        負責執行的 agent ID
+  
+  input:
+    required_files:     Pipeline 自動注入的檔案（確定性）
+    available_files:    Agent 可選讀取的檔案清單（有界自主）
+    context_from:       上游 step 的交接簡報來源
+  
+  output:
+    full_output:        完整產出寫入的檔案路徑
+    full_output_schema: 完整產出的 JSON schema 路徑（I/O 契約）
+    handoff_brief:      交接簡報寫入的檔案路徑
+    brief_format:       交接簡報的結構規範
+  
+  execution:
+    timeout_seconds:    單 step 的最大執行時間（強制終止）
+    on_timeout:         timeout 時的動作 (retry / escalate / skip)
+  
+  eval:
+    type:               eval 類型 (deterministic / llm_judge / business_metric / goal_success)
+    checks:             一個或多個檢查項目（見 Eval Gate 章節）
+    check_logic:        檢查組合邏輯 (and / weighted / hybrid)
+    threshold:          通過門檻
+  
+  recovery:
+    quality_retry_max:  品質退回的最大重試次數
+    quality_feedback_from: 退回時由哪個 step 提供反饋
+    error_retry_max:    工具錯誤的最大重試次數（通常固定 3）
+  
+  dependencies:
+    requires:           必須先完成的 step ID 列表
+    parallel_with:      可以平行執行的 step ID 列表
+```
+
+**`full_output_schema`** 把 step 之間的介面從「隱式約定」升級為「顯式契約」。有了 schema，Eval Gate 的第一道 deterministic check 就是 `output matches schema`——在做任何品質判斷前先確保結構正確。社群經驗：typed schemas 是 multi-agent workflows 的基本要求，schema 違規應被當作契約失敗來處理（retry、repair、或 escalate）。
+
+**`timeout_seconds`** 防止 agent 陷入無限生成或 API hang 時卡住整條 pipeline。Timeout 不是估計值——而是強制的硬性上限。搭配 checkpoint heartbeat：長時間任務必須定期回報進度，超過一定時間沒有回報即視為 stall。
+
+### Input 的三層設計
+
+沿用我們在 Ch2 討論的做法 C——Pipeline 分級預載 + Agent 可選讀取：
+
+| 層 | 誰決定 | 說明 |
+|----|--------|------|
+| **required_files** | Pipeline（確定性） | Initializer 自動注入，agent 一定看得到 |
+| **available_files** | Agent（有界自主） | Pipeline 提供清單，agent 透過 `read_file` 工具自行決定是否讀取 |
+| **context_from** | Pipeline（確定性） | 指定上游哪個 step 的交接簡報作為 context |
+
+確定性引擎負責保底（required_files 保證關鍵 context 不缺），Agent 在有界範圍內有自主權（available_files 讓它需要深入時可以用）。
+
+### 通用 Pipeline 骨架
+
+任何「從資料到決策」的 pipeline 都可以用四階段骨架來設計，每個階段內部的 step 數量根據需求調整：
+
+```mermaid
+graph LR
+    subgraph S1["階段 1 · Collect"]
+        direction TB
+        C1["Gather"]
+        C2["Validate"]
+        C1 --> C2
+    end
+
+    subgraph S2["階段 2 · Analyze"]
+        direction TB
+        A1["Multi-perspective<br/>(parallel)"]
+        A2["Critic"]
+        A1 --> A2
+    end
+
+    subgraph S3["階段 3 · Create"]
+        direction TB
+        CR1["Ideate"]
+        CR2["Evaluate"]
+        CR1 --> CR2
+    end
+
+    subgraph S4["階段 4 · Deliver"]
+        direction TB
+        D1["Write"]
+        D2["Report"]
+        D1 --> D2
+    end
+
+    S1 -->|"⚡ eval"| S2
+    S2 -->|"🤖 eval"| S3
+    S3 -->|"📏 eval"| S4
+    S4 -->|"🎯 eval"| CMD["Commander"]
+
+    S2 -.->|"❌ ≤3"| S1
+    S3 -.->|"❌ ≤2"| S2
+```
+
+> **範例：iGaming 產品發現場景的 8 Step 展開**
+>
+> | Step | 階段 | Agent 角色 | 輸入 | 產出 |
+> |------|------|-----------|------|------|
+> | S1 | Collect | Scout | 搜尋查詢條件 | 原始帖文/討論 |
+> | S2 | Collect | Validator | S1 產出 | 去重、標記可信度 |
+> | S3a/b/c | Analyze | Analyst ×3 (parallel) | S2 交接簡報 | 市場/風險/痛點分析 |
+> | S4 | Analyze | Critic | S3 合併報告 | 邏輯質疑、退回或放行 |
+> | S5 | Create | Ideator | S4 交接簡報 | 多方案設計 |
+> | S6 | Create | Biz Evaluator | S5 方案 | TAM、單位經濟學 |
+> | S7 | Create | Investor Lens | S6 評估 | 六維評分、VC 質疑 |
+> | S8 | Deliver | Report Writer | 所有上游摘要 | 結構化最終報告 |
+
+---
+
+## 通訊模式
+
+Step 之間傳遞資料有三種基本模式。生產環境通常混合使用。
+
+### Sequential（序列）
+
+前一個 step 的產出是後一個 step 的輸入。最簡單、最可靠。
+
+```mermaid
+graph LR
+    A["Step A"] -->|"output → input"| B["Step B"] -->|"output → input"| C["Step C"]
+```
+
+**適用場景**：step 之間有明確的依賴關係——B 必須在 A 完成後才能開始。
+
+**設計要點**：
+- 資料透過交接簡報傳遞（Ch2 Initializer Pattern），不是把完整產出塞進下一個 step
+- 如果序列過長（> 5 step），考慮在中間加入 checkpoint，讓人類可以從中斷點恢復而非從頭重跑
+
+### Parallel Fan-out / Fan-in（平行展開 / 合流）
+
+多個 step 同時執行，各自獨立處理，最後合併結果。
+
+```mermaid
+graph TD
+    INPUT["上游交接簡報"] --> A["Agent A"]
+    INPUT --> B["Agent B"]
+    INPUT --> C["Agent C"]
+    A --> MERGE["Merge step<br/>合併 + 去重 + 衝突解決"]
+    B --> MERGE
+    C --> MERGE
+    MERGE --> OUTPUT["合併後的交接簡報"]
+```
+
+**適用場景**：同一份資料需要從多個視角分析，且各視角之間沒有依賴。
+
+**設計要點**：
+- 每個平行 agent 收到相同的 input（交接簡報），但有不同的角色定義（T0）
+- 平行 agent 之間不通訊——它們不知道彼此的存在。這種刻意的隔離保留了思考的多樣性，防止早期收斂
+- **Merge step 不可省略**——三份獨立分析不會自動變成一份連貫的報告
+
+#### Merge 策略選擇
+
+「怎麼 merge」取決於平行 agent 的角色關係。
+
+| 策略 | 做法 | 適用場景 |
+|------|------|---------|
+| **Concatenate** | 直接拼接各 agent 產出 | 各 agent 負責完全不同的面向，無矛盾可能 |
+| **Synthesize** | 由獨立 agent 綜合為連貫敘述（需要一次 LLM 呼叫） | 各 agent 是互補視角，需要融合成統一結論 |
+| **Conflict Resolution** | 標記矛盾點，不強行統一，交給下游 Critic | 各 agent 是相互驗證的，矛盾本身是有價值的資訊 |
+
+社群實踐中常見兩步 reduce：第一步做結構化合併（normalize 到統一 schema + 去重），第二步由 reviewer agent 裁決衝突。
+
+選擇依據：
+- 平行 agent 是**互補的**（各看不同維度）→ **Synthesize**
+- 平行 agent 是**驗證的**（同一問題的多次嘗試）→ **Conflict Resolution**
+- 產出結構完全獨立（如不同語言的翻譯）→ **Concatenate**
+
+#### Partial Failure 與 Minimum Quorum
+
+不是所有平行 agent 都必須成功。但也不能只有一個成功就硬撐。
+
+```
+Partial failure 策略：
+├── 定義 minimum quorum（如 ≥ 2/3 成功即可 merge）
+├── ≥ quorum：先用成功的結果 merge，失敗的標記為缺失
+├── < quorum：escalate（資料不足以產出有用結果）
+└── quorum 的合理值取決於 agent 之間的關係：
+    ├── 冗餘型（同一問題多次嘗試）：quorum 可以低（2/3）
+    └── 互補型（各看不同維度）：缺一個 = 缺一個維度 → quorum 可能要更高
+```
+
+#### Parallel Timeout（平行截止時間）
+
+平行 agent 完成時間不同。不是「等最慢的」，也不是「第一個完成就走」。
+
+```
+parallel_deadline 策略：
+├── 設定統一截止時間（parallel_deadline）
+├── Deadline 到達時：
+│   ├── 已完成的 agent 結果保留
+│   ├── 未完成的 agent 強制終止
+│   └── 按 quorum 規則判斷是否可以繼續 merge
+└── Streaming 優化：第一個 agent 完成後就可以開始預處理
+    下游 merge agent 不必等所有 agent 都完成才啟動
+```
+
+### Feedback Loop（退回迴圈）
+
+後面的 step 可以把工作退回給前面的 step，附上改善建議。
+
+```mermaid
+graph LR
+    PRODUCER["Producer step<br/>（生成內容）"]
+    PRODUCER -->|"產出"| CRITIC["Critic step<br/>（品質驗證）"]
+    CRITIC -->|"✅ pass"| NEXT["→ 下一階段"]
+    CRITIC -->|"❌ fail + feedback"| PRODUCER
+```
+
+**適用場景**：產出品質需要對抗性驗證——由另一個 agent 從反面質疑，不通過就退回重做。
+
+**設計要點**：
+- **必須設定 max iterations**——沒有上限的退回迴圈會無限循環。社群常見設定是 2-3 次
+- 每次退回時，Critic 的反饋必須注入 Producer 的 context，讓它知道「上次哪裡不好」
+- 退回次數用完後 escalate 給人類（見 Ch1 Error Recovery）
+- Producer 每次重做的產出都應保存到檔案系統（Ch2 Filesystem-as-Memory），供事後分析
+
+### 混合模式
+
+生產環境幾乎都是混合使用。典型的組合：
+
+```
+Sequential 骨幹
+  └── 其中某些 step 內部用 Parallel fan-out
+  └── 某些階段之間用 Feedback loop
+```
+
+```mermaid
+graph LR
+    subgraph SEQ1["Sequential"]
+        S1["Collect"]
+        S2["Validate"]
+        S1 --> S2
+    end
+
+    subgraph PAR["Parallel"]
+        A1["Analyst A"]
+        A2["Analyst B"]
+        A3["Analyst C"]
+    end
+
+    subgraph FEED["Feedback"]
+        M["Merge"] --> CR["Critic"]
+        CR -->|"❌ ≤3"| M
+    end
+
+    subgraph SEQ2["Sequential"]
+        ID["Ideate"] --> EV["Evaluate"] --> DEL["Deliver"]
+    end
+
+    SEQ1 --> PAR
+    A1 --> M
+    A2 --> M
+    A3 --> M
+    CR -->|"✅"| SEQ2
+```
+
+---
+
+## Eval Gate 設計
+
+### 為什麼每個 Step 都需要 Eval
+
+垃圾進、垃圾出。如果 Step 1 收集了假資料，沒有 Eval Gate，這份假資料會沿著 pipeline 一路傳到最終報告。問題被發現得越晚，修復成本越高。
+
+Eval Gate 嵌入在 L3 Pipeline 層（不是 L4 Agent 層），因為品質判斷是流程控制的一部分——「這個 step 通過了嗎？」決定的是「pipeline 接下來往哪走」，這是確定性引擎的職責。
+
+### 四種 Eval 類型
+
+不同的 step 需要不同類型的品質檢查。一把尺不能量所有東西。
+
+| 類型 | 符號 | 成本 | 怎麼做 | 適用場景 |
+|------|------|------|--------|---------|
+| **Deterministic** | ⚡ | 零 | 程式碼檢查，不需要 LLM | 格式、數量、URL 有效性、JSON schema 驗證 |
+| **LLM-as-Judge** | 🤖 | 中 | 用另一個 LLM 評分（通常用高推理模型） | 邏輯一致性、品質評分、推理深度 |
+| **Business Metric** | 📏 | 低 | 針對領域特定 KPI 的自定義檢查 | 領域規則（如「競品分析至少覆蓋 N 家」） |
+| **Goal Success** | 🎯 | 中 | 評估最終任務是否完成 | 只用在 pipeline 最後一步 |
+
+### Eval Gate 的通用結構
+
+```
+eval_gate:
+  step_id:        對應的 step
+  type:           四種之一
+  
+  checks:         一個或多個檢查項目
+    - name:       檢查名稱
+      rule:       具體規則（程式碼表達式 / LLM prompt / 自定義函數）
+      weight:     權重（如果有多個檢查）
+  
+  threshold:      綜合通過門檻
+  on_fail:        失敗時的動作
+    action:       retry / escalate / skip
+    feedback_to:  退回給哪個 step
+    max_retries:  最多重試幾次
+```
+
+### Deterministic Eval（⚡）
+
+零成本、最快、最可靠。不涉及 LLM，用程式碼直接驗證。
+
+適用於可以用明確規則表達的品質要求：
+
+| 檢查 | 規則表達式（虛擬碼） | 說明 |
+|------|---------------------|------|
+| 來源數量 | `len(sources) >= N` | 確保有足夠的資料來源 |
+| URL 有效性 | `all(is_valid_url(s) for s in sources)` | 來源不是幻覺 |
+| 去重率 | `duplicate_ratio < 0.1` | 不超過 10% 重複 |
+| 格式合規 | `json.loads(output) matches schema` | 產出符合預定 schema |
+| 交接簡報完整 | `all(field is not None for field in brief)` | 每個必填欄位都有值 |
+| 字數範圍 | `min_tokens <= len(output) <= max_tokens` | 不要過短或過長 |
+
+每個 deterministic check 應在幾毫秒內完成。如果你的 eval 需要呼叫 API，它就不是 deterministic——考慮歸類為 business metric。
+
+### LLM-as-Judge（🤖）
+
+用 LLM 評分，適用於需要判斷力的檢查。
+
+設計一個 LLM-Judge 需要：
+
+1. **評分 rubric**——明確定義每個分數代表什麼，不要讓 LLM 自己決定標準
+2. **多維度獨立評分**——每個維度用一個獨立的 judge call 評分，比一次評所有維度更準確
+3. **使用高推理模型**——Judge 的模型等級應 ≥ 被評估 agent 的模型等級
+
+```
+LLM-Judge rubric 範例結構：
+
+你是一個品質評估員。請根據以下標準評分：
+
+維度 1：[維度名稱]
+  5 分：[具體描述什麼情況給 5 分]
+  3 分：[具體描述什麼情況給 3 分]
+  1 分：[具體描述什麼情況給 1 分]
+
+維度 2：[維度名稱]
+  ...
+
+請只回傳 JSON：{"dimension_1": N, "dimension_2": N, ...}
+```
+
+> **範例**：分析類 step 的 LLM-Judge 可能評估「結論是否有原始資料支撐」「是否區分了症狀和根因」「邏輯是否自洽」三個維度，每個 1-5 分，綜合 ≥ 9/15 才算通過。
+
+### Business Metric（📏）
+
+針對領域特定的 KPI，通常是 deterministic check 和 LLM-Judge 的組合。
+
+Business metric 是最需要迭代的 eval 類型——你在部署初期不會知道所有該檢查的東西。社群經驗是：隨著邊界案例的發現，持續新增檢查項目。
+
+```
+設計步驟：
+1. 從「這個 step 的產出如果爛了，會怎麼爛？」開始列舉失敗模式
+2. 每個失敗模式對應一個 check
+3. 部署後每次 escalation 都是新增 check 的候選
+4. 定期審查：有沒有 check 永遠 pass（太鬆）或永遠 fail（太緊）
+```
+
+> **範例**：商業評估類 step 可能需要檢查「市場規模估算有可驗證的數據來源？」「單位經濟學包含獲客成本？」「競品分析覆蓋至少 3 家？」這些是領域特定的，不能用通用的 LLM-Judge 替代。
+
+### Goal Success（🎯）
+
+只用在 pipeline 的最後一步。評估的不是「格式對不對」或「邏輯好不好」，而是「整個 pipeline 的目的達到了嗎？」
+
+```
+Goal success 評估問題：
+1. 這份產出有回答最初提出的問題嗎？
+2. 有明確的、可執行的下一步建議嗎？
+3. 人類讀完後能做出決策嗎？
+```
+
+Goal success 通常需要 LLM-Judge，因為判斷「任務是否完成」需要理解任務的語意。但它和普通的 LLM-Judge 不同——它看的是整體而非局部。
+
+### Eval 類型的選擇邏輯
+
+```mermaid
+graph TD
+    Q1{"能用程式碼<br/>表達規則嗎？"}
+    Q1 -->|"是"| DET["⚡ Deterministic"]
+    Q1 -->|"否"| Q2{"是領域特定的<br/>KPI 嗎？"}
+    Q2 -->|"是"| BIZ["📏 Business Metric"]
+    Q2 -->|"否"| Q3{"是最後一步嗎？"}
+    Q3 -->|"是"| GOAL["🎯 Goal Success"]
+    Q3 -->|"否"| LLM["🤖 LLM-as-Judge"]
+```
+
+原則：**能用 deterministic 就不用 LLM-Judge。** Deterministic check 更快、更便宜、更可靠、更可預測。LLM-Judge 應該只用在真正需要判斷力的地方。
+
+### Check 組合邏輯
+
+一個 Eval Gate 通常包含多個 check。它們之間怎麼組合決定了 pass/fail？
+
+| 模式 | 邏輯 | 適用場景 |
+|------|------|---------|
+| **AND** | 所有 check 必須全部 pass | Deterministic eval——結構性要求不能妥協（缺欄位 = 不合格） |
+| **Weighted** | 各 check 加權平均 ≥ threshold | LLM-Judge——品質是多維度的，某維度弱可以被其他維度補償 |
+| **Hybrid** | Deterministic checks 用 AND，LLM-Judge checks 用 Weighted | **推薦的預設模式**——結構必須正確，品質允許彈性 |
+
+Step schema 中的 `check_logic` 欄位控制使用哪種模式。
+
+Hybrid 模式的執行順序：先跑 deterministic checks（AND 模式），全部通過後才跑 LLM-Judge checks（Weighted 模式）。這樣可以在結構不合格時提前終止，避免浪費 LLM-Judge 的呼叫成本。
+
+### Eval 校準與演進
+
+Eval Gate 不是設定一次就不動的。隨著 pipeline 運行，eval 本身需要維護——否則標準會逐漸脫離實際品質需求。
+
+**數據驅動的閾值調整**
+
+| 信號 | 含義 | 動作 |
+|------|------|------|
+| pass@1 > 95% 持續 2 週 | 標準可能太鬆 | 審查並考慮提高門檻 |
+| pass@1 < 50% 持續 2 週 | 標準太嚴或 agent 能力不足 | 區分是 eval 問題還是 agent 問題 |
+| pass@2 ≈ pass@1 | 退回重做沒有改善效果 | 問題不在品質，可能在 prompt 或資料 |
+
+把這些信號接入 Observability 的 alert 規則（Ch1），自動偵測 eval 效能的漂移。
+
+**Rubric 版控**
+
+LLM-Judge 的 rubric 是 prompt——它也需要版控。變更 rubric = 變更 eval 語意。
+
+```
+Rubric 維護流程：
+├── 所有 rubric 存放在版控系統中（和程式碼一樣）
+├── 變更 rubric 時，用 golden set 跑 regression test
+│   └── golden set = 一組已知品質的產出 + 預期評分
+├── 定期（月度）用 golden set 驗證 judge 一致性
+│   └── 防止 rubric drift（同一份 rubric 隨時間產出不同評分）
+└── 記錄每個 rubric 版本對應的 pass rate 變化
+```
+
+**Meta-Eval（eval 的 eval）**
+
+定期抽樣人工審核 eval 的判定結果，特別關注兩類錯誤：
+- **False positive**（eval pass 但人類覺得品質不行）——最危險，因為劣質產出會靜默通過
+- **False negative**（eval fail 但人類覺得品質足夠）——造成不必要的退回和成本浪費
+
+Meta-eval 的頻率隨成熟度降低：早期每週抽樣，穩定後每月一次。
+
+---
+
+## 退回迴圈設計
+
+### 退回迴圈 vs Error Recovery
+
+退回迴圈（Feedback Loop）是 L3 Pipeline 層的設計——當 Eval Gate 判定品質不足時，退回給上游 step 重做。
+
+這跟 L1 的 Error Recovery 不同（見 Ch1）：
+
+| 維度 | L3 退回迴圈 | L1 Error Recovery |
+|------|-----------|-------------------|
+| **觸發** | Eval Gate fail（品質不足） | Tool failure（工具壞了） |
+| **處理** | Critic 反饋注入 context，重新推理 | Exponential backoff + 原樣重試 |
+| **上限** | 每對 step 獨立設定 | 固定 3 次 |
+| **Escalation** | 附 Critic feedback + 所有嘗試 | 附 error log + stack trace |
+
+### 觸發條件
+
+```mermaid
+graph TD
+    OUTPUT["Step 產出"]
+    OUTPUT --> EVAL{"Eval Gate"}
+    EVAL -->|"✅ Pass"| NEXT["→ 下一個 Step"]
+    EVAL -->|"❌ Fail"| CHECK{"還有重試次數？"}
+    CHECK -->|"Yes"| INJECT["注入 Critic 反饋<br/>到 Producer 的 context"]
+    INJECT --> REDO["Producer 重新生成<br/>（帶著反饋）"]
+    REDO --> OUTPUT
+    CHECK -->|"No"| ESCALATE["⚠️ Escalate<br/>附上所有嘗試的產出<br/>+ Critic 的反饋"]
+```
+
+### 設計參數
+
+| 參數 | 說明 | 建議值 |
+|------|------|--------|
+| `max_retries` | 最大退回次數 | 2-3 次（視 step 複雜度） |
+| `feedback_format` | Critic 反饋的結構 | 結構化（哪裡不好 + 為什麼 + 改善建議） |
+| `history_injection` | 是否把之前的嘗試也注入 context | 只注入最近一次（避免 context 膨脹） |
+| `cost_cap` | 退回迴圈的成本上限 | 設一個 per-loop 預算，超過即 escalate |
+| `escalation_template` | Escalation 訊息格式 | 見 Ch1 Escalation 設計 |
+
+### Critic 反饋的結構
+
+Critic 不能只說「不好」——它必須提供結構化的反饋，讓 Producer 知道具體改什麼。
+
+```
+Critic feedback 結構：
+├── verdict:        PASS / FAIL
+├── score:          量化評分（e.g., 2/5）
+├── failures:       哪些 eval check 沒通過
+│   ├── check_name: "logical_consistency"
+│   │   └── detail: "結論 A 和結論 B 互相矛盾"
+│   └── check_name: "evidence_support"
+│       └── detail: "主要論點缺少來源引用"
+└── suggestions:    改善建議
+    ├── "重新檢查結論 A 和 B 的邏輯關係"
+    └── "為主要論點補充至少 2 個來源"
+```
+
+這個結構讓 Producer 在重做時有明確方向，而非盲目重試。
+
+### 退回迴圈中的 Context 管理
+
+退回迴圈和 Context Engine（Ch2）的協作：
+
+- **每次重做時**：Initializer 組裝新的 context = T0 身份 + 上游交接簡報 + **Critic 最新的反饋**
+- **不注入所有歷史嘗試**：只注入最近一次的反饋，避免 context 膨脹。之前的嘗試寫入 Filesystem-as-Memory 供事後分析
+- **KV-Cache 影響**：Critic 反饋每次不同，屬於動態區。但固定區（system prompt + T0）仍然 cache hit
+
+---
+
+## 四個模組的協作
+
+```mermaid
+graph TD
+    DEF["Step 定義<br/>input / output / dependencies"]
+    DEF --> COMM["通訊模式<br/>Sequential / Parallel / Feedback"]
+    COMM --> EXEC["Agent 執行<br/>（L4 層）"]
+    EXEC --> EVAL["Eval Gate<br/>⚡ / 🤖 / 📏 / 🎯"]
+    EVAL -->|"✅ Pass"| NEXT["→ 下一個 Step"]
+    EVAL -->|"❌ Fail"| LOOP["退回迴圈<br/>inject feedback → retry"]
+    LOOP --> EXEC
+    LOOP -->|"max retries<br/>exhausted"| ESC["⚠️ Escalate<br/>→ L1 Error Recovery"]
+```
+
+**Pipeline 的確定性**體現在：
+1. **Step 順序**由定義檔決定，不是 LLM 即時判斷
+2. **Eval 標準**由規則定義，不是 LLM 自己評估自己
+3. **退回上限**由參數設定，不是 LLM 決定「夠好了嗎」
+4. **Escalation 觸發**由次數到達自動觸發，不需要 LLM 判斷
+
+Agent（L4）在這個框架內做它最擅長的事——理解、推理、生成。框架本身不需要 LLM 參與。
+
+---
+
+## 後續章節
+
+- **Ch4 · L4 Agent Layer** — 每個 Agent 的角色定義、prompt、Memory
+- **Ch5 · 模型選型與成本策略** — 多供應商比較、Tier 分層、成本優化
+- **Ch6 · 部署路線圖** — Phase 0-3、信任度演進、驗證標準
+
+---
+
+## References
+
+**確定性 vs LLM 驅動編排**
+- [Agentic workflows for software development - McKinsey QuantumBlack](https://medium.com/quantumblack/agentic-workflows-for-software-development-dc8e64f4a79d) — 「agent 擅長在有界問題內生成內容，但對工作流排序的元層級決策力很差」；eval 在 artifact（file）上執行而非對話
+- [Lessons From 2 Billion Agentic Workflows - CrewAI](https://blog.crewai.com/lessons-from-2-billion-agentic-workflows/) — 「取得最大成果的團隊善於把可預測的和不可預測的分開」；從 100% 人審起步，信任漸進建立
+- [How I Built a Deterministic Multi-Agent Dev Pipeline Inside OpenClaw](https://dev.to/ggondim/how-i-built-a-deterministic-multi-agent-dev-pipeline-inside-openclaw-and-contributed-a-missing-4ool) — sessions_spawn 導致不確定性流程；Lobster YAML 引擎做確定性編排
+
+**Step 定義 / I/O 契約**
+- [Multi-agent workflows often fail - GitHub Blog](https://github.blog/ai-and-ml/generative-ai/multi-agent-workflows-often-fail-heres-how-to-engineer-ones-that-dont/) — 「Typed schemas 是基本要求，schema 違規當作契約失敗處理」
+- [How AI Agents Handle Stalled Tasks and Timeouts - DEV Community](https://dev.to/bobrenze/how-ai-agents-handle-stalled-tasks-and-timeouts-lessons-from-my-production-failure-1jj9) — 每個任務有強制最大執行時間、checkpoint heartbeat、output verification
+- [Temporal AI Agent Failures: 11 Production Pitfalls](https://www.xgrid.co/resources/temporal-ai-agent-orchestration-failure-patterns/) — LLM activity retry 按 error class 定義、child workflow cancellation propagation
+
+**通訊模式**
+- [AI Agent Orchestration Patterns - Microsoft Azure](https://learn.microsoft.com/en-us/azure/architecture/ai-ml/guide/ai-agent-design-patterns) — Fan-out/Fan-in 模式定義、三種 merge 策略（voting / weighted / LLM-synthesized）、graceful degradation
+- [Multi-agent workflows often fail - GitHub Blog](https://github.blog/ai-and-ml/generative-ai/multi-agent-workflows-often-fail-heres-how-to-engineer-ones-that-dont/) — Typed schema 驗證、action constraints、MCP 作為 enforcement layer
+- [Multi-Agent Parallel Execution - Skywork](https://skywork.ai/blog/agent/multi-agent-parallel-execution-running-multiple-ai-agents-simultaneously/) — 兩步 reduce（結構化合併 + 衝突裁決）、parallel timeout + streaming、quorum 概念
+- [5 Multi-Agent Design Patterns - AgentCenter](https://agentcenter.cloud/blogs/multi-agent-design-patterns) — MapReduce 的 partial failure 處理、merge step 設計、chunk 均衡
+- [Concurrent Multi-Agent Orchestration - Arafat Tehsin](https://arafattehsin.com/blog/agent-orchestration-patterns-part-3/) — Superstep barriers、Aggregation as first-class step、conflict 結構化輸出
+- [Building a Local Research Desk: Multi-Agent Orchestration - Microsoft](https://techcommunity.microsoft.com/blog/educatordeveloperblog/building-a-local-research-desk-multi-agent-orchestration/4493965) — Sequential + concurrent fan-out + feedback loop 三種模式實踐
+
+**Eval 設計**
+- [Demystifying Evals for AI Agents - Anthropic](https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents) — pass@k、model grading 校準、eval saturation、研究類 agent 的 eval 特殊挑戰
+- [Eval-driven development - Red Hat](https://developers.redhat.com/articles/2026/03/23/eval-driven-development-build-evaluate-ai-agents) — DeepEval 框架、15 個自定義 metric 的實踐、隨邊界案例迭代 eval
+- [Crafting Effective Agents - CrewAI](https://docs.crewai.com/en/guides/agents/crafting-effective-agents) — 「80% 精力放在 Task 設計，20% 放在 Agent 定義」；expected_output 的重要性
+
+**Eval 校準與版控**
+- [A Comprehensive Guide to LLM Evaluations - Caylent](https://caylent.com/blog/a-comprehensive-guide-to-llm-evaluations) — 版控 evaluation datasets / prompts / rubrics、rubric 是 prompt 也要版控、golden set 驗證
+- [Agent Evaluation Framework 2026 - Galileo](https://galileo.ai/blog/agent-evaluation-framework-metrics-rubrics-benchmarks) — 每日/每週排程 evaluation suites 偵測 drift、meta-eval 人工抽樣、pass rate 監控
+- [LLM as a Judge - Maxim](https://www.getmaxim.ai/articles/llm-as-a-judge-a-practical-reliable-path-to-evaluating-ai-systems-at-scale/) — Rubric 設計原則、multi-model consensus、drift detection with backup judges
+
+**退回迴圈**
+- [Automating Research and Writing Workflows with CrewAI](https://markaicode.com/crewai-workflow-automation/) — Researcher → Critic → Writer pipeline 實踐；「單一 LLM 呼叫寫出平庸內容，有 Critic 的 pipeline 能通過事實查核」
+- [GAN-Inspired Multi-Agent Harnesses](https://medium.com/@gwrx2005/gan-inspired-multi-agent-harnesses-for-long-running-autonomous-software-engineering-architecture-37a8c2d59b6b) — Planner–Generator–Evaluator 三 agent 模式；GADC 框架擴展到完整開發週期
