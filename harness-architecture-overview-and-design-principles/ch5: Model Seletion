@@ -1,0 +1,350 @@
+# Ch5 · 模型選型與成本策略
+
+> 不是每個 Agent 都需要最貴的模型
+> 正確的選型和成本優化可以讓同一條 pipeline 的成本差距達 10-50 倍
+
+---
+
+## 為什麼模型選型是架構決策
+
+模型選型不只是「選哪家 API」——它是架構決策。選錯模型的後果不是「品質稍差」，而是：
+
+- **成本失控**：8 step pipeline 每步都用旗艦模型，每天跑一次，一個月可能花 $500+
+- **速度過慢**：旗艦模型的推理延遲是輕量模型的 3-10 倍，pipeline 總時間拉長
+- **品質浪費**：資料收集型 step 用旗艦模型，多出的推理能力完全用不到
+
+正確的做法是**按任務分配模型**，而非全部用同一個。
+
+---
+
+## 三個 Tier 定義
+
+### Tier 分類
+
+| Tier | 定位 | 適用的 Agent 類型 | 特徵 |
+|------|------|-----------------|------|
+| **Tier 1 · 高推理** | 最強的深度推理能力 | 品質控制、創意發散、複雜分析 | 最貴、最慢、品質最高 |
+| **Tier 2 · 均衡** | 推理能力和成本的平衡點 | 一般分析、綜合寫作、Eval Judge | 中等價格、速度適中 |
+| **Tier 3 · 低成本** | 結構化操作、簡單任務 | 資料收集、格式驗證、摘要生成 | 最便宜、最快、品質足夠 |
+
+### Tier 和 Agent 角色的對應
+
+```mermaid
+graph TD
+    subgraph T1["Tier 1 · 高推理"]
+        T1A["🎯 Critic / Evaluator"]
+        T1B["💡 Ideator (高 temperature)"]
+        T1C["🤖 LLM-Judge (Eval Gate)"]
+    end
+    subgraph T2["Tier 2 · 均衡"]
+        T2A["🧠 Analyst"]
+        T2B["📝 Report Writer"]
+        T2C["🔄 Merge / Synthesize"]
+    end
+    subgraph T3["Tier 3 · 低成本"]
+        T3A["🔍 Scout / Collector"]
+        T3B["✅ Validator (格式檢查)"]
+        T3C["📋 Summarizer"]
+    end
+```
+
+**原則：LLM-Judge 的模型等級 ≥ 被評估 Agent 的模型等級。** 用 Tier 3 模型評估 Tier 1 的產出，Judge 的判斷力不足，eval 結果不可信。
+
+**跨 Tier 的模型**：有些模型（如 GPT-5.3、DeepSeek V3.2）在性能上介於兩個 Tier 之間。歸類方式：先當 Tier 2 用、跑 10 次 eval，pass rate 和 Tier 1 相當就歸為 T1（性價比更好的 T1），不足就歸為 T3。用 eval 數據決定，不要預設。
+
+---
+
+## 六家供應商比較
+
+> **注意**：以下價格為 2026 年 Q2 的公開 API 定價（每 1M tokens），市場變化快速，部署前請驗證最新價格。
+
+### 價格總覽
+
+| 供應商 | 模型 | Tier | Input | Output | Cached Input | Context |
+|--------|------|------|-------|--------|-------------|---------|
+| **Anthropic** | Claude Opus 4.6 | T1 | $5.00 | $25.00 | $0.50 | 200K |
+| | Claude Sonnet 4.6 | T2 | $3.00 | $15.00 | $0.30 | 200K |
+| | Claude Haiku 4.5 | T3 | $0.25 | $1.25 | $0.025 | 200K |
+| **OpenAI** | GPT-5.4 | T1 | $2.50 | $15.00 | $0.25 | 128K |
+| | GPT-5.4 Pro | T1+ | $30.00 | $180.00 | — | 128K |
+| | GPT-5.3 | T1-T2 | $1.75 | $14.00 | $0.175 | 128K |
+| | GPT-5 mini | T3 | $0.25 | $2.00 | $0.025 | 128K |
+| | GPT-5 nano | T3 | $0.05 | $0.40 | $0.005 | 128K |
+| **Google** | Gemini 2.5 Pro | T2 | $1.25 | $10.00 | — | 1M |
+| | Gemini 2.5 Flash | T3 | $0.30 | $2.50 | — | 1M |
+| **xAI** | Grok 4.1 | T2 | ~$0.20 | ~$1.00 | — | 131K |
+| **DeepSeek** | V3.2 | T2-T3 | $0.14 | $0.28 | $0.028 | 128K |
+| **Meta** | Llama 3.3 70B | T2-T3 | 自架免費 | 自架免費 | — | 128K |
+
+### 品質粗略排名
+
+價格只是一半——品質差異決定了便宜的模型能不能用。
+
+| Tier | 粗略排名（2026 Q2 公開 benchmark 參考） |
+|------|----------------------------------------|
+| **T1 推理** | Opus 4.6 ≈ GPT-5.4 > GPT-5.3 > Gemini 2.5 Pro |
+| **T2 綜合** | Sonnet 4.6 ≈ GPT-5.3 > DeepSeek V3.2 > Gemini 2.5 Flash |
+| **T3 基本** | Haiku 4.5 > GPT-5 mini > GPT-5 nano ≈ Gemini Flash-Lite |
+
+> **Benchmark ≠ 你的場景。** 以上僅供初始選型參考，最終以你的 pipeline 的 eval 數據為準。不同模型在不同任務類型上的表現差異很大。
+
+### 各供應商的策略定位
+
+| 供應商 | 策略 | 優勢 | 劣勢 |
+|--------|------|------|------|
+| **Anthropic** | 品質和安全的溢價 | 最強推理、200K context、prompt caching -90% | 旗艦模型最貴 |
+| **OpenAI** | 最廣的模型光譜 | 從 nano 到 Pro 覆蓋全場景、生態最成熟 | 中間價位段選擇多到混亂 |
+| **Google** | Context window 和免費額度 | 1M context（最大）、有免費 tier | 思考 token 額外收費 |
+| **xAI** | 低價搶市場 | 極低單價 | 生態較新、社群資源少 |
+| **DeepSeek** | 極致性價比 | 品質/價格比最高、cache -90% | 中國供應商的 latency 和合規考量 |
+| **Meta** | 開源自架 | 零 API 成本、完全控制 | 需要自己的 GPU 基礎設施 |
+
+---
+
+## 三套配置方案
+
+以一個 8 step pipeline、每天跑一次、每步平均 2000 input + 1000 output tokens 為計算基準。
+
+### 方案 A · 品質優先
+
+所有需要推理的 step 用 Tier 1，只有資料收集用 Tier 3。
+
+| Step 角色 | 模型 | 單次成本估算 |
+|-----------|------|------------|
+| Scout (×1) | Haiku 4.5 | ~$0.002 |
+| Validator (×1) | Haiku 4.5 | ~$0.002 |
+| Analyst (×3 parallel) | Opus 4.6 | ~$0.105 |
+| Critic (×1) | Opus 4.6 | ~$0.035 |
+| Ideator (×1) | Opus 4.6 | ~$0.035 |
+| Evaluator (×1) | Sonnet 4.6 | ~$0.021 |
+| Quality Check (×1) | Opus 4.6 | ~$0.035 |
+| Report Writer (×1) | Sonnet 4.6 | ~$0.021 |
+| **LLM-Judge calls (~4)** | Opus 4.6 | ~$0.140 |
+| **單次 run 合計** | | **~$0.40** |
+| **月成本（30 天）** | | **~$12** |
+
+不含退回重試。如果平均每次 run 有 1-2 次退回，月成本約 $15-18。
+
+### 方案 B · 性價比
+
+Sonnet 為主力，只有 Critic 和 Judge 用 Opus。
+
+| Step 角色 | 模型 | 單次成本估算 |
+|-----------|------|------------|
+| Scout (×1) | Haiku 4.5 | ~$0.002 |
+| Validator (×1) | Haiku 4.5 | ~$0.002 |
+| Analyst (×3 parallel) | Sonnet 4.6 | ~$0.063 |
+| Critic (×1) | Opus 4.6 | ~$0.035 |
+| Ideator (×1) | Sonnet 4.6 | ~$0.021 |
+| Evaluator (×1) | Sonnet 4.6 | ~$0.021 |
+| Quality Check (×1) | Sonnet 4.6 | ~$0.021 |
+| Report Writer (×1) | Sonnet 4.6 | ~$0.021 |
+| **LLM-Judge calls (~4)** | Opus 4.6 | ~$0.140 |
+| **單次 run 合計** | | **~$0.33** |
+| **月成本（30 天）** | | **~$10** |
+
+### 方案 C · 最低成本
+
+DeepSeek + Haiku 為主力，只有 Judge 用較高模型。
+
+| Step 角色 | 模型 | 單次成本估算 |
+|-----------|------|------------|
+| Scout (×1) | GPT-5 nano | ~$0.0004 |
+| Validator (×1) | GPT-5 nano | ~$0.0004 |
+| Analyst (×3 parallel) | DeepSeek V3.2 | ~$0.003 |
+| Critic (×1) | Sonnet 4.6 | ~$0.021 |
+| Ideator (×1) | DeepSeek V3.2 | ~$0.001 |
+| Evaluator (×1) | DeepSeek V3.2 | ~$0.001 |
+| Quality Check (×1) | Sonnet 4.6 | ~$0.021 |
+| Report Writer (×1) | DeepSeek V3.2 | ~$0.001 |
+| **LLM-Judge calls (~4)** | Sonnet 4.6 | ~$0.084 |
+| **單次 run 合計** | | **~$0.13** |
+| **月成本（30 天）** | | **~$4** |
+
+### 三方案對比
+
+| | 方案 A 品質優先 | 方案 B 性價比 | 方案 C 最低成本 |
+|---|---|---|---|
+| 月成本 | ~$15 | ~$10 | ~$4 |
+| 品質 | 最高 | 高（大部分場景足夠） | 中（簡單場景足夠） |
+| 適用階段 | 品質驗證期 | **生產環境推薦** | 早期原型 / 高頻低複雜度 |
+
+> **以上估算未含 prompt caching 和 Batch API 折扣。** 加上成本優化後，實際成本可再降 50-80%（見下節）。
+
+### 方案之間的遷移路徑
+
+不需要一開始就選定最終方案。用 eval 數據驅動遷移：
+
+```
+遷移觸發條件：
+├── C → B：多個 step 的 eval pass rate < 70%，低成本模型推理能力不足
+├── B → A：關鍵 step（Critic / Ideator）的 eval 需要更強推理
+├── A → B：eval 穩定後，逐步降級非關鍵 step 以節省成本
+└── 原則：和選型決策流程一致——用 eval 數據驅動，不要預設
+```
+
+### 方案 C 的風險提醒
+
+方案 C 使用 DeepSeek 和 GPT-5 nano 做主力，成本最低但有額外風險：
+
+- **DeepSeek**：中國供應商，可能有跨境 latency、資料合規（GDPR 等）、以及服務穩定性的考量。建議搭配備用供應商
+- **GPT-5 nano**：最便宜但推理能力有限，複雜分析任務可能品質不足
+- **建議**：方案 C 適合早期原型驗證，但進入生產前應升級到方案 B 並用 eval 確認品質
+
+---
+
+## 成本優化技巧
+
+### 1. Prompt Caching（-90% input 成本）
+
+Ch2 詳細說明了 KV-Cache 的三條規則（穩定前綴、append-only、確定性序列化）。效果：
+
+| 區塊 | 佔比 | 是否 cache | 等效價格 |
+|------|------|-----------|---------|
+| System prompt + T0 + constraints | ~40% | ✅ cache hit | 0.1× |
+| Output format + eval criteria | ~20% | ✅ cache hit | 0.1× |
+| T2 知識片段 | ~10% | ⚠️ 週更（一週內 hit） | 0.1×（大部分時間） |
+| 交接簡報 + task | ~30% | ❌ 每次不同 | 1.0× |
+| **加權平均** | | | **~0.37×** |
+
+**Input 成本等效打了 63% 折扣。**
+
+### 2. Batch API（-50% 全部成本）
+
+如果 pipeline 是定時執行（每日一次）而非即時互動，可以使用 Batch API。大部分供應商提供 50% 折扣，換取 24 小時內完成（而非即時回應）。
+
+### 3. Tiered Routing（-70-85% 整體成本）
+
+不是所有 step 都需要旗艦模型。社群經驗：70% 的 production workload 用中低端模型就能達到和旗艦模型相同的品質。
+
+```
+Routing 策略：
+├── 簡單任務（資料收集、格式驗證）→ Tier 3（GPT-5 nano / Haiku）
+├── 中等任務（分析、寫作）→ Tier 2（Sonnet / GPT-5.3 / DeepSeek）
+├── 困難任務（品質控制、複雜推理）→ Tier 1（Opus）
+└── 如果 70% 流量是簡單、20% 中等、10% 困難
+    → 有效成本從 Tier 1 單價降低約 85%
+```
+
+### 4. 疊加效果
+
+> **注意**：Tiered routing 的折扣已經包含在三套方案的價格中了——方案 B 和 C 本身就是混合模型的。因此疊加計算只加 prompt caching 和 Batch API，不重複計算 routing。
+
+```
+疊加計算（以方案 B 為例）：
+├── 原始月成本：~$10
+├── Prompt caching（-63% input 成本）：input 佔總成本 ~40%
+│   → $10 × (1 - 0.63 × 0.4) = ~$7.50
+├── Batch API（-50%）：$7.50 × 0.5 = ~$3.75
+└── 實際月成本：~$3-4
+```
+
+| 優化 | 折扣 | 備註 |
+|------|------|------|
+| Prompt caching | -63% input 成本 | 固定前綴佔比越高越有效 |
+| Batch API | -50% 全部成本 | 僅限非即時場景（24hr 內完成） |
+| Tiered routing | 已含在方案 B/C 中 | 不額外計算 |
+| **Caching + Batch 疊加** | **方案 B: ~$3-4/月** | 從 $10 降到 $3-4 |
+
+---
+
+## 選型決策流程
+
+### 核心原則：先跑通，再優化
+
+不要在部署前花一週比較模型。正確的流程是用 eval 數據驅動選型決策。
+
+```mermaid
+graph TD
+    START["Phase 0: 全部用同一個 Tier 2 模型"]
+    START --> RUN["跑 10+ 次 run<br/>收集 eval 數據"]
+    RUN --> ANALYZE{"分析每個 step 的<br/>eval pass rate"}
+    ANALYZE -->|"某 step pass rate < 70%"| UPGRADE["升級該 step 到 Tier 1"]
+    ANALYZE -->|"某 step pass rate > 95%"| DOWNGRADE["降級該 step 到 Tier 3"]
+    ANALYZE -->|"pass rate 70-95%"| KEEP["維持 Tier 2"]
+    UPGRADE --> RERUN["重新跑 10 次<br/>比較升級前後的 eval"]
+    DOWNGRADE --> RERUN
+    RERUN --> STABLE{"eval 穩定？"}
+    STABLE -->|"是"| DEPLOY["部署配置"]
+    STABLE -->|"否"| ANALYZE
+```
+
+### 決策流程的每一步
+
+**Phase 0 · 全部用同一個 Tier 2 模型建立 baseline**
+
+所有 step 都用同一個 Tier 2 模型。目的不是最佳品質——而是建立 eval baseline。
+
+為什麼不直接用最好的模型？因為你需要一個「中間線」來判斷哪些 step 需要升級、哪些可以降級。如果一開始就全用 Tier 1，你不知道降級到 Tier 2 後品質會掉多少。
+
+```
+Phase 0 baseline 模型的選擇：
+├── 推薦：Sonnet 4.6（品質穩定、指令遵循好、結果可複現性高）
+├── 預算敏感：GPT-5.3 或 Gemini 2.5 Pro 也可以
+├── 極低預算：DeepSeek V3.2（但品質波動較大，baseline 可能不穩定）
+└── 關鍵：baseline 模型的品質要「中等偏上」
+    → 太弱的 baseline 會導致大部分 step 都需要升級，失去 baseline 的意義
+```
+
+**Phase 1 · 用 eval 數據決定升降級**
+
+跑 10+ 次 run 後，檢查每個 step 的 eval pass rate：
+
+| pass rate | 判斷 | 動作 |
+|-----------|------|------|
+| < 70% | Tier 2 推理能力不足 | 升級到 Tier 1 |
+| 70-95% | 品質足夠 | 維持 Tier 2 |
+| > 95% | 任務太簡單，Tier 2 過度 | 試降級到 Tier 3 |
+
+**Phase 2 · 驗證降級不影響品質**
+
+降級後再跑 10 次，比較 eval pass rate。如果降級後 pass rate 沒有顯著下降（< 5% 變化），確認降級。如果下降 > 10%，回退到 Tier 2。
+
+**Phase 3 · 持續監控**
+
+模型供應商會更新模型。每次模型版本升級後，重新跑 eval suite，確認配置是否需要調整。這和 Ch3 的 Eval 校準機制（model upgrade trigger）一致。
+
+### 多供應商策略
+
+不要綁死在一家供應商。建議：
+
+```
+多供應商架構：
+├── 主力供應商（大部分 step）
+├── 備用供應商（主力不可用時的 fallback）
+└── 成本供應商（低複雜度 step 用最便宜的選項）
+```
+
+好處：
+- **避免供應商鎖定**——API 介面相似，切換成本低
+- **價格談判籌碼**——有替代選項時議價能力更強
+- **災備**——一家供應商宕機不影響整條 pipeline
+
+風險：
+- 不同供應商的模型行為有差異，prompt 可能需要微調
+- 多套 API 金鑰管理、錯誤處理邏輯各異
+
+---
+
+## 後續章節
+
+- **Ch6 · 部署路線圖** — Phase 0-3、信任度演進、驗證標準
+
+---
+
+## References
+
+**模型定價**
+- [LLM API Pricing 2026 - TLDL](https://www.tldl.io/resources/llm-api-pricing-2026) — 全供應商價格比較、成本優化三疊加（caching + batch + routing）、「70-80% workload 用中端模型品質相同」
+- [AI API Pricing Comparison - IntuitionLabs](https://intuitionlabs.ai/articles/ai-api-pricing-comparison-grok-gemini-openai-claude) — Grok/Gemini/GPT/Claude 的詳細定價和策略分析（2026 年 2 月更新）
+- [LLM API Pricing Comparison - CostGoat](https://costgoat.com/compare/llm-api) — 307+ 模型比較、value score（quality per dollar）、各場景推薦模型
+
+**成本優化**
+- [Context Engineering for AI Agents - Manus](https://manus.im/blog/context-engineering-for-ai-agents) — Prompt caching 的穩定前綴策略、避免時間戳破壞 cache
+- [Complete LLM Pricing Comparison 2026 - Cloudidr](https://www.cloudidr.com/blog/llm-pricing-comparison-2026) — Output tokens 成本 3-10× 高於 input、Intelligent Model Routing 降低 37-89% 成本
+- [Cost Optimization Strategies for Enterprise AI Agents - Datagrid](https://datagrid.com/blog/8-strategies-cut-ai-agent-costs) — Graceful degradation 控制成本、circuit breaker 暫停昂貴工具、成本 dashboard 設計
+
+**選型策略**
+- [Lessons From 2 Billion Agentic Workflows - CrewAI](https://blog.crewai.com/lessons-from-2-billion-agentic-workflows/) — 「從 100% 人審起步，用數據決定放手」——同樣邏輯適用於模型選型
+- [Building Effective Agents - Anthropic](https://www.anthropic.com/engineering/building-effective-agents) — Agent 能力邊界、工具設計影響模型選擇
+- [Demystifying Evals for AI Agents - Anthropic](https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents) — Eval 驅動的迭代決策，model upgrade 時重跑 eval suite
