@@ -1,0 +1,435 @@
+# Ch2 · L2 Context Engine
+
+> 控制每個 step「看到什麼」和「記住什麼」
+> 直接決定產出品質和 API 成本
+
+---
+
+## 本章涵蓋
+
+L2 位於 L1（Harness Shell）之內、L3（Pipeline）之外。它的職責是在每個 step 執行前，組裝出乾淨、精準、成本可控的 context。
+
+```mermaid
+graph LR
+    subgraph L2["L2 · Context Engine"]
+        M1["Initializer Pattern"]
+        M2["Filesystem-as-Memory"]
+        M3["KV-Cache Strategy"]
+        M4["T1→T2 Distillation"]
+    end
+```
+
+L2 解決兩個核心問題：
+
+| 問題 | 說明 | 後果 |
+|------|------|------|
+| **Context Rot** | 過期資訊累積在 context 中，agent 無法分辨新舊 | 產出引用被推翻的結論、品質隨時間劣化 |
+| **成本失控** | Context 膨脹導致 input token 線性增長 | 單次 run 成本隨 pipeline 深度增加而爆炸 |
+
+---
+
+## Context Rot：問題定義
+
+### 什麼是 Context Rot
+
+LLM 每次推理時，把 context window 裡的所有內容等權重對待。它沒有「新鮮度」的概念——一個月前的分析和今天的新數據，在模型眼裡沒有區別。
+
+當 pipeline 持續運行，以下情況會逐步惡化：
+
+1. **單次 run 內的累積**：前面 step 的完整產出被串接傳給後面的 step，context 逐步膨脹
+2. **跨日的累積**：每天 run 的工作記憶（T1 daily logs）越積越多，agent 花大量 context window 讀舊日誌
+3. **被推翻的結論殘留**：某個 step 的初步分析說 X，下游的 Critic 修正為 Y，但如果 X 和 Y 同時存在於 context 中，後續 agent 可能引用已被推翻的 X
+
+### 傳播機制
+
+Context rot 不是靜態存在——它會沿著 pipeline 傳播和放大。
+
+```mermaid
+graph TD
+    S1["Step 1 output<br/>2000 tokens"] --> S2_IN["Step 2 input<br/>= S1 output (2000 tok)"]
+    S2_IN --> S2["Step 2 output<br/>1500 tokens"]
+    S2 --> S3_IN["Step 3 input<br/>= S1 + S2 (3500 tok)"]
+    S3_IN --> S3["Step 3 output<br/>3000 tokens"]
+    S3 --> S4_IN["Step 4 input<br/>= S1 + S2 + S3 (6500 tok)"]
+    S4_IN --> S4["Step 4 output<br/>2000 tokens"]
+    S4 --> SN_IN["Step N input<br/>= all previous (20000+ tok)<br/>70% 是不需要的中間過程"]
+
+    style SN_IN fill:#4A1B0C,stroke:#D85A30,color:#F5C4B3
+```
+
+到了 pipeline 末端，agent 的 context 裡充滿了早期 step 的中間推導過程、被否決的假設、重複的資料引用。Agent 無法分辨哪些還有效，品質隨之劣化。
+
+同時，input token 線性增長直接推高成本。如果每個 step 平均產出 2000 tokens，8 step pipeline 在最後一步的 input 將超過 16000 tokens——其中大部分是上游的雜訊。
+
+---
+
+## 機制 1：Initializer Pattern
+
+### 原理
+
+每個 step 不繼承上游的完整歷史，而是從乾淨狀態開始，只收到一份結構化的「交接簡報」。如同團隊交班——接手的人不讀過去 8 小時的每條訊息，而是收到一份摘要。
+
+這從根本上切斷了 context rot 的傳播路徑：過期資訊不會被帶進下一個 step。
+
+```mermaid
+graph LR
+    subgraph WITHOUT["❌ 沒有 Initializer"]
+        W_IN["Step N+1 input:<br/>S1 全文 + S2 全文 + S3 全文<br/>+ S4 全文 + 7 天記憶<br/>= 15000+ tokens 雜訊"]
+    end
+
+    subgraph WITH["✅ 有 Initializer"]
+        I_IN["Step N+1 input:<br/>T0 身份定義<br/>+ Step N 交接簡報 (500 tok)<br/>+ T2 相關知識片段<br/>= ~2000 tokens 精準"]
+    end
+```
+
+### 交接簡報格式
+
+摘要不是讓 LLM 隨意總結——它必須遵循固定結構，確保每次交接的資訊完整且可驗證。格式本身也是一種 eval：任一欄位空白，Eval Gate 應攔下來。
+
+```
+## Step N → Step N+1 Handoff Brief
+
+### Conclusions (required, ≤ 3 items)
+- ...
+- ...
+
+### Key data points (required, quantifiable)
+- ...
+
+### Unresolved issues (required, for downstream steps)
+- ...
+
+### File paths (required)
+- Full output: /outputs/step_n_full.md
+- Source data: /outputs/step_n_sources.json
+```
+
+設計原則：
+
+| 原則 | 做法 | 原因 |
+|------|------|------|
+| **篇幅限制** | ≤ 500 tokens | 防止摘要本身膨脹 |
+| **結論優先** | 結論放第一欄位 | 下游 step 最需要的是「你做了什麼決定」，不是推導過程 |
+| **量化數據** | 必須包含可量化的事實 | 防止摘要變成空泛的描述 |
+| **未解決標記** | 明確列出缺口 | 讓下游知道哪些問題需要自己處理 |
+| **檔案路徑** | 指向完整產出的位置 | 如果下游真的需要細節，可以主動去讀 |
+
+### Initializer 的組裝邏輯
+
+每個 step 啟動前，Initializer 按以下順序組裝 context：
+
+```mermaid
+graph TD
+    START["Step N+1 啟動"]
+    START --> LOAD_T0["1. 載入 T0 身份定義<br/>(SOUL.md / AGENTS.md)<br/>= agent 的角色和行為規範"]
+    LOAD_T0 --> LOAD_BRIEF["2. 載入 Step N 的交接簡報<br/>= 上游的結論和數據"]
+    LOAD_BRIEF --> QUERY_T2["3. 查詢 T2 長期知識<br/>= 與本次任務相關的歷史教訓"]
+    QUERY_T2 --> ASSEMBLE["4. 組裝 context<br/>T0 + Brief + T2 片段"]
+    ASSEMBLE --> INJECT["5. 注入 Step N+1 的 prompt"]
+    INJECT --> EXECUTE["Step N+1 執行"]
+```
+
+T2 查詢不是全量注入——而是根據本次任務的關鍵字做相關性匹配，只取最相關的知識片段。這進一步控制了 context 大小。
+
+---
+
+## 機制 2：Filesystem-as-Memory
+
+### 原理
+
+每個 step 的完整產出寫入檔案系統，而非塞進下一個 step 的 context window。Context 裡只放摘要和檔案路徑。
+
+這個概念來自 Manus 團隊的實踐：「agent 把關鍵資訊寫入檔案、需要時讀取，而非全塞進 context window。」
+
+### 分流邏輯
+
+每個 step 完成後，產出被分成兩條路徑：
+
+```mermaid
+graph TD
+    OUTPUT["Step N 完成，產出 output"]
+    OUTPUT --> FULL["完整產出<br/>(可能 5000+ tokens)"]
+    OUTPUT --> BRIEF["結構化摘要<br/>(≤ 500 tokens)"]
+
+    FULL --> FS["寫入檔案系統<br/>/outputs/step_n_full.md"]
+    BRIEF --> CTX["注入 Step N+1 的 context"]
+
+    FS --> ONDEMAND{"下游 step<br/>需要細節？"}
+    ONDEMAND -->|"是"| READ["主動讀取檔案<br/>（例外情況）"]
+    ONDEMAND -->|"否"| SKIP["不讀<br/>（預設行為）"]
+```
+
+大部分時候，下游 step 只需要上游的結論，不需要推導過程。主動讀取檔案是例外行為，不是預設行為。
+
+### 檔案系統結構
+
+```
+/outputs/
+├── run_{date}_{id}/
+│   ├── step1_full.md               # Step 1 完整產出
+│   ├── step1_sources.json          # Step 1 原始資料來源
+│   ├── step1_to_step2_brief.md     # Step 1 → Step 2 交接簡報
+│   ├── step2_full.md
+│   ├── step2_to_step3_brief.md
+│   ├── step3_agent_a.md            # 平行 agent 各自的完整產出
+│   ├── step3_agent_b.md
+│   ├── step3_agent_c.md
+│   ├── step3_merged.md             # 合併後的產出
+│   ├── step3_to_step4_brief.md
+│   ├── ...
+│   └── final_report.md             # 最終報告
+├── run_{date}_{id+1}/
+│   └── ...
+└── memory/
+    ├── T1/
+    │   ├── {date_1}.md              # 當日工作記憶
+    │   └── {date_2}.md
+    └── T2/
+        └── MEMORY.md                # 精煉後的長期知識
+```
+
+### 什麼時候該讀檔案 vs 只看摘要
+
+| 情況 | 讀檔案？ | 說明 |
+|------|---------|------|
+| 下一個 step 只需要結論 | 否，只看摘要 | **預設行為**，大部分情況 |
+| 驗證型 agent 需要查核具體引述 | 是 | 品質控制的工作就是深挖細節 |
+| 評估型 agent 需要檢查具體數據 | 是 | 數字不能只靠摘要傳遞 |
+| 最終產出需要引用原始來源 | 是 | 報告需要可追溯的引用 |
+| 退回重做時 agent 需要看之前的嘗試 | 是 | 避免重複犯同樣的錯 |
+
+設計原則：**讀檔案是 agent 的主動行為，需要有明確理由。Initializer 不會自動注入檔案內容。**
+
+---
+
+## 機制 3：KV-Cache Prompt 結構策略
+
+### 原理
+
+當你呼叫 LLM API 時，供應商的伺服器會 cache 你送過去的 prompt 的中間計算結果（Key/Value tensors）。如果下一次呼叫的 prompt 前綴和上次完全相同，供應商直接重用 cache，不重新計算。
+
+成本差異巨大：cached tokens 比 uncached tokens 便宜約 **10 倍**（Anthropic: $0.30/M vs $3.00/M input）。
+
+但 cache 極度脆弱：**一個 token 的差異，就會從該點開始讓 cache 失效。** 即使語意相同，token 序列不同就會 miss。
+
+### 三條操作規則
+
+**規則 1 · 穩定前綴（Stable Prefix）**
+
+固定內容放最前面，動態內容放最後。每次呼叫的前半段完全相同，才能命中 cache。
+
+```
+每個 Agent 的 API 呼叫結構：
+┌──────────────────────────────────┐
+│ 固定區（每次 100% 相同）          │ ← cache hit，0.1× 價格
+│ • System prompt                  │
+│ • T0 身份定義 (SOUL.md)           │
+│ • Eval 標準定義                   │
+├──────────────────────────────────┤
+│ 半固定區（每週更新一次）           │ ← 一週內 cache hit
+│ • T2 長期知識片段                 │
+├──────────────────────────────────┤
+│ 動態區（每次不同）                │ ← 全價，但佔比小
+│ • 上游交接簡報 (≤ 500 tok)        │
+│ • 本次具體任務描述                 │
+└──────────────────────────────────┘
+```
+
+如果固定區 + 半固定區佔 70% 的 input tokens，等效打了約 65% 折扣。
+
+常見錯誤：在 system prompt 開頭加入每天不同的時間戳。雖然讓 agent 知道今天日期，但完全殺死了 cache 重用。把時間戳放在動態區的最前面即可。
+
+**規則 2 · Append-only（只附加，不修改歷史）**
+
+多輪對話或跨 step 的 context 傳遞時，保持前面的內容不動，新內容加在最後。
+
+```
+✅ 正確：
+[system prompt] → [T0] → [T2] → [brief from step N] → [task for step N+1]
+ ← 這段每次都一樣，cache hit ──→   ← 只有這裡是新的
+
+❌ 錯誤：
+每次重新整理或重排之前的內容
+→ 即使語意相同，token 順序不同就會 cache miss
+```
+
+**規則 3 · 確定性序列化（Deterministic Serialization）**
+
+如果你的交接簡報或工具回傳值包含 JSON，必須確保每次序列化的結果完全相同。
+
+```
+❌ Python dict 轉 JSON，key 順序可能每次不同：
+   {"score": "high", "category": "infrastructure"}   ← 第一次
+   {"category": "infrastructure", "score": "high"}   ← 第二次
+   → 語意一樣但 token 序列不同 → cache miss
+
+✅ 使用 sort_keys=True：
+   json.dumps(data, sort_keys=True)
+   → 每次產出完全相同的 token 序列 → cache hit
+```
+
+許多程式語言和序列化函式庫不保證穩定的 key 排序。這個問題很隱蔽——功能完全正常，但成本莫名偏高，因為 cache 被悄悄破壞了。
+
+### 搭配 Batch API 疊加
+
+Pipeline 如果是每日定時執行（非即時互動），可以使用 Batch API。大部分供應商的 Batch API 提供 50% 折扣，換取 24 小時內完成（而非即時回應）。
+
+疊加效果：
+- Prompt caching：固定前綴 -90%
+- Batch API：全部 -50%
+- 兩者疊加：最高 **-95%**
+
+> **範例**：一個 8 step pipeline 每天跑一次，每個 agent 的 system prompt + T0 + eval 標準佔 1500 tokens（固定區），交接簡報佔 500 tokens（動態區）。固定區 cache hit 後，75% 的 input 以 0.1× 計價。再搭配 Batch API，整條 pipeline 的 input 成本約為全價的 5-8%。
+
+---
+
+## 機制 4：T1→T2 精煉週期
+
+### 解決什麼問題
+
+機制 1-3 解決的是單次 run 內的 context rot。但 pipeline 每天跑一次，跨日的工作記憶（T1 daily logs）會持續累積。一週後有 7 份 daily log，一個月後有 30 份。如果全部注入 context，同樣會膨脹失控。
+
+T1→T2 精煉把原始工作記錄壓縮為驗證過的長期知識，解決跨日的 context rot。
+
+### 記憶層級
+
+| 層級 | 內容 | 寫入時機 | 注入時機 | 生命週期 |
+|------|------|---------|---------|---------|
+| **T0 · 身份** | SOUL.md / AGENTS.md | Agent 定義時 | 每次 run 開始 | 穩定（極少變動） |
+| **T1 · 工作記憶** | Daily log：做了什麼、學到什麼、出了什麼錯 | 每次 run 結束 | 同日 run 內參考 | 短期（7-30 天後歸檔） |
+| **T2 · 長期知識** | MEMORY.md：驗證過的模式、永久教訓 | T1 精煉時 | 每次 run 開始（經 Initializer 相關性匹配） | 長期（直到被顯式更新或移除） |
+
+### 精煉流程
+
+```mermaid
+graph TD
+    ACCUMULATE["T1 daily logs 累積<br/>Day 1, Day 2, ... Day 7"]
+    ACCUMULATE --> TRIGGER{"精煉觸發條件？"}
+    TRIGGER -->|"定時：每 7 天"| DISTILL["精煉程序啟動"]
+    TRIGGER -->|"容量：T1 累積 > N 條"| DISTILL
+    TRIGGER -->|"未觸發"| WAIT["繼續累積"]
+
+    DISTILL --> READ["讀取所有待精煉的 T1 logs"]
+    READ --> EXTRACT["提煉重複出現的模式<br/>和有價值的教訓"]
+    EXTRACT --> VERIFY["驗證：是否與既有 T2 矛盾？<br/>是否有足夠證據支撐？"]
+    VERIFY -->|"通過"| WRITE_T2["寫入 T2 MEMORY.md"]
+    VERIFY -->|"矛盾"| RESOLVE["人類審查<br/>決定保留哪個版本"]
+    WRITE_T2 --> ARCHIVE["T1 原始 logs 歸檔<br/>（不再自動注入 context）"]
+```
+
+### 精煉的品質控制
+
+精煉不是簡單的「總結」——它需要品質控制，否則精煉出來的 T2 本身就是錯的，會長期污染所有 run。
+
+| 檢查 | 做什麼 | 範例 |
+|------|--------|------|
+| **頻率驗證** | 只提煉在多次 run 中重複出現的模式 | 「Pattern X 在 5 次 run 中出現 4 次」→ 值得提煉 |
+| **矛盾檢查** | 新精煉的結論是否與既有 T2 矛盾 | 如果矛盾，標記為需要人類審查 |
+| **可量化** | 精煉結論必須包含可驗證的事實 | ❌「普遍反應不佳」→ ✅「47/100 筆資料提到 issue X」 |
+| **過期標記** | 標記精煉結論的有效期限 | 市場數據可能 3 個月就過期 |
+
+### 精煉後的 context 注入
+
+精煉完成後，T2 的內容不是全量注入——而是由 Initializer 根據本次 run 的任務做相關性匹配。
+
+```
+Day 8 的 Step 3 啟動時：
+
+context = [
+  T0: 身份定義 (固定)
+  +
+  Step 2 交接簡報 (500 tok)
+  +
+  T2 相關條目: "過去 7 天的精煉知識片段" (200 tok)
+]
+
+→ 不是讀 7 天原始 logs，而是精煉後的知識片段
+→ context 穩定在 ~2000 tok，不隨天數增長
+```
+
+> **範例**：在產品發現場景中，T2 條目可能是「過去 7 天，用戶痛點 X 出現 4 次，痛點 Y 出現 1 次」。在競品監控場景中，可能是「競品 A 在過去一週更新了兩次定價」。具體內容取決於你的 pipeline 目標。
+
+---
+
+## 效果對照
+
+```
+                    沒有 L2                        有 L2
+                    ──────                         ──────
+Context 大小
+  Step 1            2000 tok                       2000 tok
+  Step 4            8500 tok                       ~2000 tok
+  Step 8            20000+ tok                     ~2000 tok
+  趨勢              逐 step 線性膨脹               每 step 穩定
+
+過時資訊
+  單次 run          累積傳播到末端                  每 step 切斷
+  跨日              T1 日誌無限增長                 T1→T2 定期精煉
+
+成本
+  Input tokens      全價（無 cache hit）            固定前綴 cache hit -90%
+  Batch             —                              搭配 Batch -50%
+  疊加              全價                            最高 -95%
+
+品質
+  後段 step         被上游雜訊干擾                  乾淨工作環境
+  跨日              引用過期數據                    只引用精煉後的知識
+  被推翻的結論      新舊結論同時存在                只有最新的結論進入 context
+```
+
+---
+
+## 四個機制的協作
+
+```mermaid
+graph TD
+    subgraph SINGLE_RUN["單次 Run 內"]
+        direction LR
+        INIT["Initializer<br/>每 step 乾淨注入"]
+        FS["Filesystem-as-Memory<br/>完整產出寫檔<br/>摘要進 context"]
+        KV["KV-Cache Strategy<br/>穩定前綴省錢"]
+    end
+
+    subgraph CROSS_RUN["跨 Run"]
+        T1T2["T1→T2 Distillation<br/>工作記憶→長期知識"]
+    end
+
+    INIT -->|"組裝 context 時<br/>查詢 T2"| T1T2
+    FS -->|"step 結束時<br/>寫 T1 daily log"| T1T2
+    T1T2 -->|"精煉後的知識<br/>供下次 run 使用"| INIT
+    KV -->|"固定區不變<br/>cache 跨 run 命中"| INIT
+```
+
+**單次 run**：Initializer 組裝乾淨 context → agent 執行 → 完整產出寫檔（Filesystem）→ 摘要交接給下一步 → KV-Cache 確保固定前綴省錢
+
+**跨 run**：每次 run 結束寫 T1 → 定期精煉到 T2 → 下次 run 的 Initializer 查詢 T2 注入相關知識
+
+四個機制缺一不可：沒有 Initializer 就會 context rot，沒有 Filesystem 就會 context 膨脹，沒有 KV-Cache 就會成本失控，沒有 T1→T2 就會跨日劣化。
+
+---
+
+## 後續章節
+
+- **Ch3 · L3 Pipeline** — Step 定義、Eval Gate 詳細設計、通訊模式
+- **Ch4 · L4 Agent Layer** — 每個 Agent 的角色定義、prompt、Memory
+- **Ch5 · 模型選型與成本策略** — 多供應商比較、Tier 分層、成本優化
+- **Ch6 · 部署路線圖** — Phase 0-3、信任度演進、驗證標準
+
+---
+
+## References
+
+**Context Rot / Context Management**
+- [The Agent Harness Is the Architecture](https://medium.com/@epappas/the-agent-harness-is-the-architecture-and-your-model-is-not-the-bottleneck-5ae5fd067bb2) — Manus 的 filesystem-as-memory 設計、context 管理直接決定成本（100:1 input-to-output ratio）
+- [The Complete Guide to Agent Harness](https://harness-engineering.ai/blog/agent-harness-complete-guide/) — Context rot 定義、initializer + coding agent 雙 agent 模式
+- [Using OpenClaw as a Force Multiplier](https://towardsdatascience.com/using-openclaw-as-a-force-multiplier-what-one-person-can-ship-with-autonomous-agents/) — 三層記憶實踐（daily logs → MEMORY.md 精煉）
+
+**KV-Cache / Prompt Caching**
+- [Unlocking the Power of KV Cache - Data Science Dojo](https://datasciencedojo.com/blog/kv-cache-how-to-speed-up-llm-inference/) — Stable prefix、append-only、deterministic serialization 三原則，引用 Manus 的 context engineering 實踐
+- [KV Cache Optimization: Memory Efficiency for Production LLMs](https://introl.com/blog/kv-cache-optimization-memory-efficiency-production-llms-guide) — PagedAttention、cache 命中率與成本的關係
+- [Context Engineering for AI Agents: Lessons from Building Manus](https://manus.im/blog/context-engineering-for-ai-agents) — 原始出處：穩定前綴、避免時間戳破壞 cache、確定性序列化
+
+**Memory Architecture**
+- [Agent Engineering: IMPACT Framework](https://www.morphllm.com/agent-engineering) — Memory 作為 agent 六維度之一（Intent、Memory、Planning、Authority、Control Flow、Tools）
+- [Agentic workflows for software development - McKinsey QuantumBlack](https://medium.com/quantumblack/agentic-workflows-for-software-development-dc8e64f4a79d) — Eval 在 artifact（file）上執行，不在對話回應上
+- [Why AI Agents Fail: 3 Failure Modes - AWS DEV Community](https://dev.to/aws/why-ai-agents-fail-3-failure-modes-that-cost-you-tokens-and-time-1flb) — Memory Pointer Pattern（200KB → 100 bytes），context window overflow 的解法
