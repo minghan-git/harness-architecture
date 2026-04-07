@@ -1,0 +1,568 @@
+# Ch1 · L1 Harness Shell
+
+> Agent 的安全邊界和運行環境
+> L1 是最外層，包住所有內層，提供四個基礎設施模組
+
+---
+
+## 本章涵蓋
+
+```mermaid
+graph LR
+    subgraph L1["L1 · Harness Shell"]
+        AUTH["🔐 Authority"]
+        OBS["📡 Observability"]
+        ERR["🔧 Error Recovery"]
+        EVO["🔄 Self-Improvement"]
+    end
+```
+
+| 模組 | 核心問題 |
+|------|---------|
+| Authority | Agent 能做什麼、不能做什麼？誰來批准？ |
+| Observability | Agent 正在做什麼？花了多少錢？哪裡出問題？ |
+| Error Recovery | 工具失敗了怎麼辦？品質不夠好怎麼辦？ |
+| Self-Improvement | 怎麼讓同樣的錯誤不再發生？哪些組件可以移除？ |
+
+---
+
+## 1. Authority Layer
+
+### 為什麼需要 Authority
+
+Agent 連接了 API、檔案系統、資料庫、外部服務之後，它就不再是聊天機器人，而是一個有手的操作員。如果不設計權限，agent 終究會做出你不希望的事——不是因為惡意，而是因為 LLM 的判斷力有邊界。
+
+Authority 的核心原則是**最小權限（Least Privilege）**：給 agent 剛好足夠完成任務的權力，不多給一分。
+
+### 能力 ≠ 權限
+
+這是 Authority 最重要的架構分離。Agent 的推理能力（Model 層）和它被允許的操作（Harness 層）是兩個獨立的系統。
+
+```mermaid
+graph TB
+    AGENT["Agent 想執行某個動作"]
+    AGENT --> STATIC{"靜態權限檢查<br/>工具白名單內？"}
+    STATIC -->|"不在白名單"| BLOCK["🚫 攔截 + 記錄"]
+    STATIC -->|"在白名單內"| RUNTIME{"Runtime 權限檢查<br/>預算/風險額度足夠？"}
+    RUNTIME -->|"額度耗盡"| BLOCK
+    RUNTIME -->|"額度足夠"| RISK{"風險等級？"}
+    RISK -->|"低風險 (read-only)"| ALLOW["✅ 直接執行"]
+    RISK -->|"中風險 (write)"| CAP["⚠️ 執行但限制後續額度"]
+    RISK -->|"高風險 (irreversible)"| HUMAN["👤 人類審批"]
+    HUMAN -->|"批准"| ALLOW
+    HUMAN -->|"拒絕"| BLOCK
+```
+
+### 靜態權限 vs 動態權限
+
+**靜態權限**是部署時設定的，不隨執行改變。例如「這個 agent 可以使用搜尋工具」——這是一個能力宣告。
+
+**動態權限（Runtime Permissions）** 是執行時即時計算的。同一個 agent 在 run 開頭可能有完整工具存取權，但到了中段因為預算或風險額度耗盡，高成本工具的存取會被動態收回。
+
+Runtime permissions 使用三態決策模型：
+
+| 決策 | 含義 | 說明 |
+|------|------|------|
+| **ALLOW** | 在額度內，正常執行 | 大部分 read-only 操作 |
+| **ALLOW_WITH_CAPS** | 允許但限制後續操作 | 執行後降低剩餘額度，可能關閉部分工具 |
+| **DENY** | 不允許，agent 必須停止或降級 | 預算/風險點數耗盡 |
+
+二元的 allow/deny 會強制硬停。三態模型讓系統在接近邊界時漸進降級，而非突然中斷。
+
+### 三階段審批序列
+
+每次工具呼叫都經過這三個階段，順序不能亂。
+
+| 階段 | 時機 | 做什麼 |
+|------|------|--------|
+| **Trust establishment** | Pipeline run 啟動時 | 載入全域約束、確認 agent 身份、綁定工具白名單 |
+| **Pre-execution check** | 每個工具呼叫前 | 檢查白名單、檢查剩餘預算/風險額度、判斷風險等級 |
+| **Human confirmation** | 高風險操作觸發時 | 推送審批請求給人類，附上操作描述和 context |
+
+順序很重要——如果在信任建立之前就允許執行，等於跳過了權限檢查。
+
+### 權限矩陣的設計方式
+
+矩陣的四個維度：Read（讀取什麼）、Write（寫入什麼）、External API（呼叫哪些外部服務）、Requires Approval（哪些操作需要人類批准）。
+
+每個 agent 的權限獨立定義，不共用 credential。一個 agent 的 credential 被洩露時，影響範圍只限於該 agent 的白名單。
+
+```
+設計步驟：
+1. 列出 agent 需要完成的任務
+2. 推導出完成任務的最小工具集
+3. 對每個工具分配 read/write/api 權限
+4. 標記所有不可逆操作為 requires approval
+5. 設定全域約束（預算上限、禁止動作列表）
+```
+
+### 全域約束
+
+無論哪個 agent，以下約束永遠生效：
+
+```
+Global constraints:
+├── Budget cap per run:         人類在每次 run 前設定
+├── Max tokens per agent call:  防止單次呼叫吃掉整個預算
+├── Forbidden actions:          定義「永遠不能做」的操作清單
+├── All external API calls:     強制記錄到 Observability
+└── Runtime permission model:   三態決策 (ALLOW / ALLOW_WITH_CAPS / DENY)
+```
+
+> **範例**：iGaming 產品發現場景中，forbidden actions 可能是「不得在社群媒體發文、不得進行任何購買行為」。投資研究場景中，可能是「不得執行任何交易、不得存取個人帳戶資訊」。具體清單取決於你的業務風險。
+
+### 工具降級策略
+
+當 agent 的工具被動態收回（預算耗盡、API 故障、circuit breaker 觸發）時，如果沒有預定義的降級行為，agent 可能會無限重試被拒的呼叫（浪費 token）、直接放棄整個 step（太激進）、或試圖繞過限制（安全風險）。
+
+每個工具在註冊時應同時定義降級路徑。降級信號必須是結構化的，讓 LLM 能理解發生了什麼並調整行為，而非靜默回傳空值。
+
+社群實踐中常見四種降級層級：
+
+| 降級層級 | 策略 | 說明 |
+|---------|------|------|
+| **Feature-level** | 跳過失敗的功能，繼續處理 | 標記為 pending，後續補回 |
+| **Quality-level** | 降級到較便宜/較快的模型或工具 | 品質降低但流程不中斷，記錄以便後續重處理 |
+| **Speed-level** | 從即時切換到批次模式 | 延遲增加但任務完成 |
+| **Channel-level** | 切換輸出通道 | 主通道不行換備用，備用不行就 log |
+
+```
+降級信號格式（結構化，非靜默 None）：
+{
+  "status": "degraded",
+  "tool": "search_api",
+  "reason": "budget_exceeded",
+  "fallback": "cached_results_available",
+  "missing_capability": "real-time search"
+}
+```
+
+Agent 收到降級信號後的行為規則：
+1. 承認缺失——在產出中明確標記哪些資料是降級後取得的
+2. 使用替代路徑——如果有 fallback 工具或 cached data，優先使用
+3. 不得重複嘗試被拒的工具——收到 DENY 後禁止再呼叫同一工具
+
+---
+
+## 2. Observability
+
+### 為什麼需要 Observability
+
+Agent 會靜默失敗。它不會像傳統程式一樣拋出錯誤訊息然後停止——它會繼續運行，但產出垃圾。沒有 Observability，你可能好幾天都不知道系統已經在產出低品質結果。
+
+傳統 APM（Application Performance Monitoring）追蹤延遲和錯誤率，但無法回答 agent 特有的問題：「為什麼 agent 選了錯誤的工具？」「為什麼分析結論偏離了事實？」「哪 5% 的請求消耗了 50% 的 token？」
+
+### 三類監控指標
+
+Agent 的 Observability 需要同時追蹤三個維度：
+
+**Operational（系統健不健康）**
+
+| Metric | 說明 | 建議 target | Alert threshold |
+|--------|------|------------|----------------|
+| Run success rate | 整條 pipeline 完成的比例 | > 95% | < 90% |
+| Step completion rate | 每個 step 成功的比例 | > 98% | < 95% |
+| Latency per step | 單 step 耗時 | 依場景 | > 2× historical avg |
+| Error rate | 工具錯誤比例 | < 5% | > 10% |
+| Retry rate | 重試觸發的比例 | < 10% | > 20% |
+
+**Quality（產出好不好）**
+
+| Metric | 說明 | 建議 target | Alert threshold |
+|--------|------|------------|----------------|
+| Eval gate pass rate | 每 step 的 eval 通過率 | > 80% | < 60% |
+| Feedback loop trigger rate | 品質退回觸發的頻率 | < 30% | > 50% |
+| Final output score | 最終產出的綜合評分 | 依場景 | < baseline × 0.8 |
+| Hallucination rate | 幻覺（無法驗證的陳述）比例 | < 5% | > 10% |
+
+**Cost（花了多少錢）**
+
+| Metric | 說明 | 建議 target | Alert threshold |
+|--------|------|------------|----------------|
+| Total cost per run | 單次 run 總成本 | 依預算 | > 2× target |
+| Cost per step | 各 step 成本 | — | > 3× historical avg |
+| Token usage per call | 單次 LLM 呼叫的 token 量 | — | > 2× historical avg |
+| Cache hit rate | Prompt cache 命中率 | > 70% | < 50% |
+| Top 5% cost | 最貴的 5% 請求花了多少 | — | > 5× median |
+
+### Tracing 策略
+
+Tracing 的目標是讓每個 agent 的每個動作都能追溯到觸發它的 input。當出問題時，你需要能從最終產出一路回溯到源頭。
+
+建議採用 **OpenTelemetry** 標準。它是 vendor-agnostic 的，確保你的 tracing 資料不被綁死在某個工具上。
+
+一條 trace 代表一次完整的 pipeline run，由多個 span 組成。每個 span 對應一個 step 或一次工具呼叫。
+
+```mermaid
+graph LR
+    subgraph TRACE["Trace: one complete run"]
+        direction LR
+        SP1["Span: Step 1<br/>duration: 8s<br/>cost: $0.02"]
+        SP2["Span: Step 1 Eval<br/>result: PASS<br/>duration: 0.1s"]
+        SP3["Span: Step 2<br/>duration: 3s<br/>cost: $0.01"]
+        SP4["Span: Step 2 Eval<br/>result: PASS"]
+        SP1 --> SP2 --> SP3 --> SP4
+    end
+```
+
+**每個 Span 應記錄的欄位**：
+
+| Field | 說明 |
+|-------|------|
+| `trace_id` | 整條 run 的唯一 ID |
+| `span_id` | 本 step 的唯一 ID |
+| `parent_span_id` | 上游 step 的 ID（用來重建依賴鏈） |
+| `agent_id` | 哪個 agent 執行的 |
+| `model` | 用了哪個模型和版本 |
+| `input` | 送進去什麼（truncated，避免儲存敏感資料） |
+| `output` | 產出什麼（truncated） |
+| `tokens_in / tokens_out` | Token 用量 |
+| `cost` | 本次呼叫成本 |
+| `duration_ms` | 耗時 |
+| `eval_result` | Eval Gate 結果（PASS / FAIL / SKIP） |
+| `error` | 錯誤訊息（如有） |
+| `cache_hit` | Prompt cache 是否命中 |
+
+### Dashboard 設計原則
+
+Dashboard 不是越多圖表越好。設計原則：
+
+1. **一眼看出今天有沒有問題**——頂部放 summary cards（run 數、pass 率、總成本、總時間）
+2. **能下鑽到具體 step**——每個 step 一行，顯示狀態、成本、耗時、eval 結果
+3. **能看趨勢**——30 天的 cost per run、eval pass rate、cache hit rate 趨勢圖
+4. **能看失敗模式聚類**——不只看「失敗了幾次」，而是「什麼類型的失敗最常見」
+
+### 工具選擇
+
+工具的選擇取決於你的規模和現有基礎設施。不要在早期就導入重量級工具。
+
+| Tool | Type | Best for |
+|------|------|---------|
+| **Langfuse** | Open source | 自架、完全控制、適合早期 |
+| **Braintrust** | SaaS | Eval + observability 整合、免費額度充足 |
+| **LangSmith** | SaaS | LangChain 生態、原生支援好 |
+| **Grafana + OpenTelemetry** | Open source | 自定義 dashboard、資料可攜 |
+| **Datadog / Azure Monitor** | Enterprise | 已有企業基礎設施、需要跨系統整合 |
+
+> **起步建議**：用 Langfuse（開源自架）或 Braintrust（免費額度）。等到 pipeline 穩定運行、有足夠資料後，再決定是否需要更重的工具。
+
+### Alert 路由與分級
+
+有了 threshold 但沒有路由，等於有煙霧偵測器但沒接消防隊。Alert 需要按嚴重程度分級，不同級別走不同通道，避免 alert fatigue（當所有東西都緊急時，沒有東西是緊急的）。
+
+| 級別 | 條件 | 通知方式 | 回應時間 |
+|------|------|---------|---------|
+| **P1** | Pipeline 停擺、安全事件 | 即時推送（Telegram/SMS/電話） | 分鐘級 |
+| **P2** | 品質持續劣化、成本異常飆升 | 推送到 Slack/通訊群組 | 小時級 |
+| **P3** | 單次 eval 失敗、輕微成本偏高 | 每日匯總報告 | 次日 |
+| **P4** | 趨勢偏移、效率可優化 | 週報中標記 | 下次審查 |
+
+設計原則：
+- **只 alert 需要人類動作的事件**——能自動恢復的（Error Recovery 處理的重試）不應觸發 alert
+- **支持自動升級**——P3 持續 15 分鐘未解決升為 P2，P2 持續 30 分鐘升為 P1
+- **追蹤 alert 有效率**——如果某類 alert 的處理率低於 50%，代表分級有問題
+
+### Observability → Self-Improvement 的接口
+
+Observability 記錄的資料如何流向 Self-Improvement 的 Failure Registry？
+
+- **早期（Phase 0-1）**：每次 escalation 由人類手動在 Failure Registry 中打 `pattern_tag`，因為失敗數量少，人工分類更精準
+- **成熟期（Phase 2+）**：Observability 工具自動聚類失敗模式（Langfuse、Braintrust 都支援 cluster analysis），人工確認後寫入 Registry
+- **資料格式**：Observability 的 span 記錄（trace_id、error、eval_result）是 Self-Improvement 分析的原始輸入
+
+---
+
+## 3. Error Recovery
+
+### 為什麼需要雙路徑
+
+Multi-agent pipeline 有兩種本質不同的失敗：
+
+1. **工具失敗**——API timeout、rate limit、格式解析錯誤。問題出在「執行」，不是 agent 的推理。
+2. **品質不足**——Eval Gate 判定產出不夠好。問題出在「推理」，不是工具。
+
+這兩種失敗需要完全不同的處理邏輯。混在一起會導致「API 壞了」和「分析太淺」用同一套重試機制，結果兩個都處理不好。
+
+### 雙路徑設計
+
+```mermaid
+graph TD
+    STEP["Step N 執行"]
+    STEP --> EXEC{"執行成功？<br/>（工具有回應嗎？）"}
+
+    EXEC -->|"❌ Tool failure"| ERR_PATH["🔧 Error Recovery Path"]
+    ERR_PATH --> RETRY{"Retry ≤ 3?"}
+    RETRY -->|"Yes"| BACKOFF["Exponential backoff + retry<br/>（等待時間逐次加倍）"]
+    BACKOFF --> STEP
+    RETRY -->|"No"| ESC_ERR["⚠️ Escalate to human<br/>附上 error log"]
+
+    EXEC -->|"✅ Output produced"| EVAL{"Eval Gate pass?<br/>（品質夠好嗎？）"}
+    EVAL -->|"❌ Quality insufficient"| Q_PATH["🎯 Quality Feedback Path"]
+    Q_PATH --> REDO{"Retry ≤ N?<br/>(N = step config)"}
+    REDO -->|"Yes"| FEEDBACK["把 Critic 反饋餵回<br/>agent 重新生成"]
+    FEEDBACK --> STEP
+    REDO -->|"No"| ESC_Q["⚠️ Escalate to human<br/>附上 Critic feedback"]
+
+    EVAL -->|"✅ Pass"| NEXT["→ Step N+1"]
+```
+
+### 兩條路徑的差異
+
+| 維度 | Error Recovery Path | Quality Feedback Path |
+|------|---|---|
+| **觸發條件** | Tool 失敗、API timeout、格式錯誤 | Eval Gate 判定品質不足 |
+| **問題本質** | 執行層——工具壞了 | 推理層——agent 想得不夠好 |
+| **處理方式** | Exponential backoff + 原樣重試 | 把反饋注入 context，要求重新推理 |
+| **重試上限** | 固定 3 次（所有 step 一致） | 每 step 獨立設定（依場景調整） |
+| **Escalation 內容** | Error log、stack trace、重試歷史 | Critic 反饋、所有嘗試的產出 |
+| **人類決策選項** | 跳過 / 手動修復 / 中止 | 補充資料 / 調整標準 / 中止 |
+
+### Escalation 訊息設計
+
+推送給人類的 escalation 必須包含足夠 context，讓人能做決定而不需要追問 agent。設計原則：
+
+1. **一眼看出什麼壞了**——哪個 step、哪條路徑、第幾次嘗試
+2. **附上決策所需的全部資料**——錯誤日誌或 Critic 反饋、所有嘗試的產出
+3. **提供可選的動作**——不要讓人自己想下一步做什麼
+
+```
+Escalation message structure:
+├── Run ID + Step name + Path type
+├── Duration and cost consumed
+├── Root cause summary (1-2 sentences)
+├── Attachments (error logs OR critic feedback + all attempts)
+└── Recommended actions (checkboxes)
+    ├── Retry with additional context
+    ├── Adjust eval threshold for this run
+    ├── Skip this step and proceed
+    └── Abort run
+```
+
+> **範例**：一個 Analyst step 連續三次被 Critic 退回，理由是「分析缺乏原始資料引述」。Escalation 附上三次產出和 Critic 的反饋，推薦動作是「提供額外來源資料後重跑」或「降低本次 eval 門檻」。
+
+### Backoff 參數建議
+
+Error Recovery Path 的 exponential backoff 不是「等一下再試」這麼簡單。參數設計影響恢復效率和成本：
+
+```
+建議 backoff 參數：
+├── Base interval:  2 seconds
+├── Multiplier:     ×2 each retry
+├── Max interval:   30 seconds
+├── Jitter:         ±20%（避免多個 agent 同時重試造成 thundering herd）
+└── 3 次 retry 的實際等待: ~2s, ~4s, ~8s
+```
+
+搭配 **circuit breaker** 模式防止持續打壞掉的服務：
+- **CLOSED**（正常）：請求正常通過，追蹤失敗率
+- **OPEN**（服務故障）：失敗率超標時立即拒絕請求，回傳 cached 或 fallback 值
+- **HALF-OPEN**（測試恢復）：冷卻期後放一個測試請求通過，成功則關閉 circuit
+
+不是所有錯誤都值得重試。分類後再決定：
+- **可重試**：429（rate limit）、500/502/503/504（暫時性錯誤）、timeout
+- **不可重試**：401（auth 失敗）、403（權限不足）、400（輸入驗證錯誤）——這些是設定問題，重試不會修好
+
+### Partial Failure 處理原則
+
+目前的雙路徑設計是二元的：整個 step 成功或失敗。但 fan-out 場景中（例如三個 Analyst 平行跑），可能只有一個失敗。全部重跑浪費資源，全部放棄損失已完成的工作。
+
+核心原則：**永遠不要丟棄已完成的工作。一個 80% 完成的任務仍然有價值。**
+
+處理方式取決於子任務之間是否有資料依賴：
+
+| 場景 | 子任務關係 | 處理方式 |
+|------|----------|---------|
+| **Fan-out（平行）** | 無依賴，各自獨立 | 只重跑失敗的，保留成功的 |
+| **Sequential（序列）** | 有依賴，下游需要上游 | 從失敗點重跑，不回溯已完成的上游 |
+| **Partial data acceptable** | 失敗的是補充性資料 | 跳過，標記缺口，繼續流程 |
+| **Partial data unacceptable** | 失敗的是關鍵資料 | 重試失敗的部分，不繼續 |
+
+Agent 在產出中應標記資料完整度，讓下游和人類知道結果的可信程度。
+
+> **範例**：三個 Analyst 平行分析同一份資料，Market Analyst 和 Pain Point Analyst 成功，Risk Assessor 因 API timeout 失敗。正確做法：只重跑 Risk Assessor，保留另外兩個的結果。如果重試 3 次仍失敗，用已有的兩份分析繼續流程，在報告中標記「風險評估缺失——資料不完整」。
+
+---
+
+## 4. Self-Improvement Loop
+
+### 原則：一次性修復 → 永久性約束
+
+每一次 escalation 都是一個學習機會。如果修完就忘，同樣的問題會反覆出現。Self-Improvement 的核心是把一次性修復轉化為永久性的系統約束——讓同樣的錯誤在架構層級上不可能再發生。
+
+這個概念來自 Harness Engineering 社群的經驗：「當 agent 犯錯，工程師不只修復產出——他們改造系統使錯誤永不再發。」
+
+```mermaid
+graph LR
+    FAIL["Failure occurs"]
+    FAIL --> FIX["One-time fix<br/>（解決這次的問題）"]
+    FIX --> LOG["Log to failure registry<br/>（記錄失敗模式 + 嚴重度）"]
+    LOG --> TRACK{"觸發條件？"}
+    TRACK -->|"頻率軌：same pattern ≥ 3"| PERMANENT["Convert to<br/>permanent constraint"]
+    TRACK -->|"嚴重度軌：單次損失超標<br/>或觸發安全紅線"| PERMANENT
+    TRACK -->|"都未達標"| MONITOR["Continue monitoring"]
+    PERMANENT --> UPDATE["Update system:<br/>Eval rule / Agent prompt /<br/>Tool config / Authority policy"]
+    UPDATE --> TEST["Verify constraint<br/>catches the pattern"]
+    TEST --> DEPLOY["Deploy to pipeline"]
+```
+
+### 雙軌觸發條件
+
+不是所有失敗都需要出現三次才處理。一次 $50 的意外付費 API 呼叫不應該等三次。
+
+| 軌道 | 觸發條件 | 適用場景 |
+|------|---------|---------|
+| **頻率軌** | 同一 pattern_tag 累計 ≥ 3 次 | 低損失、高頻率的問題 |
+| **嚴重度軌** | 單次損失超過預設金額門檻，或觸發安全紅線 | 高損失、低頻率的問題 |
+
+兩軌並行，任一觸發即轉為永久約束。Dollar budgets 衡量財務風險，但最昂貴的事故在 token 成本上不一定最貴——200 封錯誤 email 的模型呼叫只花 $1.40，但可能造成數萬美元的商業損失。因此嚴重度軌應按「爆炸半徑和可逆性」評估，而非僅看 token 成本。
+
+### Failure Registry
+
+追蹤失敗不是只記「失敗了幾次」，而是記「什麼類型的失敗」。Registry 用 pattern tag 分類，讓你看到聚類而非個案。
+
+| Field | 說明 |
+|-------|------|
+| `pattern_id` | 失敗模式的唯一 ID |
+| `pattern_tag` | 分類標籤（e.g. `source_quality`, `logic_gap`, `api_timeout`） |
+| `severity` | 嚴重度（`low` / `medium` / `high` / `critical`） |
+| `occurrences` | 出現次數 |
+| `total_cost_impact` | 累計造成的成本損失 |
+| `first_seen` / `last_seen` | 首次和最近出現日期 |
+| `affected_steps` | 涉及哪些 step |
+| `resolution_status` | `monitoring` / `constraint_added` / `step_removed` |
+| `constraint_ref` | 對應的永久約束（如已加入） |
+
+### 永久約束的五種類型
+
+當雙軌任一條件觸發時，從以下五種約束中選擇最適合的來消除它：
+
+| 約束類型 | 生效位置 | 做什麼 |
+|---------|---------|--------|
+| **Eval rule** | L3 · Eval Gate | 新增或修改品質檢查規則 |
+| **Prompt update** | L4 · Agent | 在 agent 的指令中加入明確約束 |
+| **Tool config** | L1 · Error Recovery | 修改工具的重試策略、timeout、fallback |
+| **Authority policy** | L1 · Authority | 修改預算限制、工具白名單、審批條件 |
+| **Step removal** | L3 · Pipeline | 合併或移除不再需要的 step |
+
+> **範例**：
+> - 失敗模式 `api_timeout` 出現 5 次 → Tool config：加入 exponential backoff 和 fallback 備用工具
+> - 失敗模式 `missing_sources` 出現 4 次 → Eval rule：新增「來源數 ≥ N」的硬性檢查
+> - 失敗模式 `conflated_analysis` 出現 3 次 → Prompt update：agent 指令加入「必須區分 X 和 Y」
+> - 失敗模式 `unexpected_paid_api` 出現 1 次但損失 $50 → 嚴重度軌觸發 → Authority policy：立即加入付費 API 審批門檻
+
+### 約束衝突解決
+
+隨著永久約束越來越多，可能出現矛盾。例如 eval rule 要求「至少引用 5 個來源」，但 authority policy 限制了「每次 run 最多 10 次 API 呼叫」——當 5 個來源需要 15 次 API 呼叫時，兩條約束衝突。
+
+解決原則：
+
+1. **Authority 約束永遠優先於 Eval 要求**——安全 > 品質。這是預設規則，不需要人類介入
+2. **衝突本身是一個 failure pattern**——記錄到 Failure Registry，觸發人類審查。衝突往往說明某條約束的設計有問題，需要重新評估而非機械套用優先級
+3. **不允許靜默降級**——當 authority 約束阻止了 eval 要求時，必須在產出中標記「品質受限於資源約束」
+
+> **注意**：這條原則來自安全工程的通用實踐（safety over quality），但「multi-agent pipeline 中 eval rule 和 authority policy 具體如何衝突解決」這個場景，目前社群尚無成熟案例。建議在實際部署中根據經驗迭代。
+
+### Build for Deletion
+
+每個 step、每個 agent、每條 eval rule 都應該有一個「移除條件」。當條件滿足時，這個組件就該被簡化或移除。
+
+這個原則來自 Harness Engineering 的核心觀念：「每段 harness 邏輯都應有過期日。如果下一代模型能在沒有你的鷹架下完成某件事，就刪掉鷹架。」
+
+設計方式：每個組件建立時同時寫下兩個欄位。
+
+| 欄位 | 說明 | 範例 |
+|------|------|------|
+| **存在理由** | 這個組件解決了什麼具體問題？ | 「Model 會幻覺出假來源」 |
+| **移除條件** | 什麼條件成立時，這個組件不再需要？ | 「Hallucination rate < 1% 且來源可自動驗證」 |
+
+### 定期審查節奏
+
+Self-Improvement 不是被動等錯誤出現，而是主動定期審查。
+
+```
+Weekly:   Review failure registry → any pattern ≥ 3 occurrences?
+Monthly:  Review Build for Deletion table → any component removable?
+          Review cost trends → any step disproportionately expensive?
+          Review eval thresholds → any threshold too loose or too tight?
+On model upgrade: Re-run all eval suites → which steps can be simplified?
+```
+
+---
+
+## 四個模組的協作
+
+L1 的四個模組不是獨立運作，而是形成一個閉環。
+
+```mermaid
+graph TB
+    subgraph RUN["一次 Pipeline Run"]
+        direction TB
+        AUTH_CHECK["🔐 Authority<br/>載入約束 · 檢查權限"]
+        PIPELINE["⚙️ Pipeline 執行"]
+        ERR_HANDLE["🔧 Error Recovery<br/>工具失敗 → retry<br/>品質不足 → feedback"]
+        OBS_LOG["📡 Observability<br/>每個 span 記錄<br/>cost / token / eval / error"]
+    end
+
+    subgraph POST["Run 結束後"]
+        REVIEW["🔄 Self-Improvement<br/>分析失敗模式<br/>更新約束"]
+    end
+
+    AUTH_CHECK --> PIPELINE
+    PIPELINE --> ERR_HANDLE
+    ERR_HANDLE -->|"resolved"| PIPELINE
+    ERR_HANDLE -->|"escalated"| CMD["👤 Human"]
+    PIPELINE --> OBS_LOG
+    OBS_LOG --> REVIEW
+    REVIEW -->|"update rules"| AUTH_CHECK
+```
+
+**閉環運作**：
+1. **Authority** 設定邊界 → agent 只能在邊界內行動
+2. **Pipeline** 在邊界內執行 → 過程中會遇到失敗
+3. **Error Recovery** 處理失敗 → 能自動恢復的自動恢復，不能的 escalate
+4. **Observability** 記錄一切 → 提供分析失敗模式的資料
+5. **Self-Improvement** 從資料中學習 → 把教訓轉為更好的邊界
+6. 回到 **Authority** → 下一次 run 從更好的約束開始
+
+每一次 run 都讓系統比上一次更好。這不是手動優化——而是架構層級的持續改善機制。
+
+---
+
+## 後續章節
+
+- **Ch2 · L2 Context Engine** — Context rot 防護、KV-Cache 策略、交接簡報設計
+- **Ch3 · L3 Pipeline** — Step 定義、Eval Gate 詳細設計、通訊模式
+- **Ch4 · L4 Agent Layer** — 每個 Agent 的角色定義、prompt、Memory
+- **Ch5 · 模型選型與成本策略** — 多供應商比較、Tier 分層、成本優化
+- **Ch6 · 部署路線圖** — Phase 0-3、信任度演進、驗證標準
+
+---
+
+## References
+
+本章的設計模式和建議來自以下社群實踐和技術文獻：
+
+**Authority / 權限模型**
+- [AI Agent Permissions: Least-Privilege Access Control](https://kla.digital/blog/ai-agent-permissions) — 六維度權限模型（identity → policy gate → tools → approval → evidence）
+- [AI Agent Runtime Permissions](https://runcycles.io/blog/ai-agent-runtime-permissions-control-actions-before-execution) — 三態決策模型（ALLOW / ALLOW_WITH_CAPS / DENY）、RISK_POINTS 概念
+- [AI Agent Permission Models: Least Privilege Guide](https://agentnode.net/blog/ai-agent-permission-models-least-privilege) — 每工具獨立權限宣告、JIT elevation
+
+**工具降級 / Graceful Degradation**
+- [AI Agent Error Handling: Fallback Strategies](https://agentmelt.com/blog/ai-agent-error-handling-fallback-strategies/) — 四層降級（Feature / Quality / Speed / Channel）、circuit breaker 模式
+- [How to Set Graceful Degradation Timeouts](https://how2.sh/posts/how-to-build-agent-tool-timeout-envelopes-for-safer-rollouts-for-mission-critical-automations/) — 結構化降級信號設計、工具分級（Critical / Optional）
+- [Building Self-Healing AI Agents with Claude API](https://claudelab.net/en/articles/api-sdk/claude-api-self-healing-agent-production-patterns) — Detect → Diagnose → Heal → Verify 四階段恢復循環
+
+**Observability / Alert 路由**
+- [How to Implement Alert Priority Levels](https://oneuptime.com/blog/post/2026-01-30-alert-priority-levels/view) — P1-P5 分級框架、自動升級規則
+- [Alert Fatigue Reduction with AI Agents - IBM](https://www.ibm.com/think/insights/alert-fatigue-reduction-with-ai-agents) — AI 驅動的 alert 聚類和動態閾值
+- [AI Agent Monitoring: Best Practices 2026](https://uptimerobot.com/knowledge-hub/monitoring/ai-agent-monitoring-best-practices-tools-and-metrics/) — 失敗模式聚類、OpenTelemetry 標準
+
+**Partial Failure / 部分失敗處理**
+- [Handling Partial Failures in AI Agent Workflows](https://skillful.sh/blog/how-ai-agents-handle-partial-failures-gracefully) — 「永遠不要丟棄已完成的工作」原則、confidence scoring
+- [AI Agent Orchestration Patterns - Microsoft Azure](https://learn.microsoft.com/en-us/azure/architecture/ai-ml/guide/ai-agent-design-patterns) — Fan-out/Fan-in 模式、graceful degradation for multi-agent
+- [Multi-agent workflows often fail - GitHub Blog](https://github.blog/ai-and-ml/generative-ai/multi-agent-workflows-often-fail-heres-how-to-engineer-ones-that-dont/) — Schema 驗證、action 約束
+
+**Self-Improvement / 持續改善**
+- [Harness Engineering: The Complete Guide 2026](https://www.nxcode.io/resources/news/harness-engineering-complete-guide-ai-agent-codex-2026) — 「錯誤→永久約束」的工程文化
+- [Agent Engineering: IMPACT Framework](https://www.morphllm.com/agent-engineering) — swyx 的六維度框架
+- [Demystifying Evals for AI Agents - Anthropic](https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents) — Eval 作為品質持續改善的基石
